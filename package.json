@@ -1,0 +1,22 @@
+{
+  "name": "bizup-challenge",
+  "version": "1.0.0",
+  "private": true,
+  "description": "비즈업클래스 유료 수강생·챌린지 관리 서비스",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node --disable-warning=ExperimentalWarning src/server.js",
+    "init-admin": "node --disable-warning=ExperimentalWarning scripts/init-admin.js",
+    "seed": "node --disable-warning=ExperimentalWarning scripts/seed.js",
+    "test": "node --disable-warning=ExperimentalWarning --test test/*.test.js"
+  },
+  "engines": {
+    "node": ">=22.13"
+  },
+  "dependencies": {
+    "express": "^5.3.0",
+    "iconv-lite": "^0.7.3",
+    "multer": "^1.4.5-lts.2",
+    "xlsx": "^0.18.5"
+  }
+}
