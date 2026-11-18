@@ -1,6 +1,7 @@
 'use strict';
 // 데모 데이터 생성. 사용: npm run seed  (빈 DB에서 실행 권장)
-const { get } = require('../src/db');
+const { get, run, uuid, now, close } = require('../src/db');
+const { hashPassword } = require('../src/auth');
 const { createApp } = require('../src/server');
 const { Client } = require('./client');
 
@@ -9,8 +10,13 @@ const INSTRUCTOR = { email: 'teacher@bizup.local', password: 'teacher1234!', nam
 const kstDate = (offsetDays) => new Date(Date.now() + 9 * 3600e3 + offsetDays * 86400e3).toISOString().slice(0, 10);
 
 (async () => {
-  if (get('SELECT 1 FROM courses LIMIT 1')) { console.log('이미 데이터가 있어 시드를 건너뜁니다. (data/ 폴더를 비우고 다시 실행하세요)'); return; }
-  require('child_process').execFileSync(process.execPath, ['--disable-warning=ExperimentalWarning', require.resolve('./init-admin'), '--email', ADMIN.email, '--name', '운영관리자', '--password', ADMIN.password], { stdio: 'inherit' });
+  if (await get('SELECT 1 AS ok FROM courses LIMIT 1')) { console.log('이미 데이터가 있어 시드를 건너뜁니다.'); await close(); return; }
+  if (!(await get('SELECT 1 AS ok FROM staff_accounts WHERE email = ?', ADMIN.email))) {
+    const id = uuid();
+    await run(`INSERT INTO staff_accounts(id, email, name, password_hash, status, created_at, updated_at) VALUES(?,?,?,?,'ACTIVE',?,?)`,
+      id, ADMIN.email, '운영관리자', await hashPassword(ADMIN.password), now(), now());
+    await run(`INSERT INTO staff_roles(staff_id, role) VALUES(?, 'ADMIN')`, id);
+  }
   const server = createApp().listen(0);
   const base = `http://127.0.0.1:${server.address().port}`;
   const must = (r, what) => { if (r.status >= 300) throw new Error(`${what}: ${r.status} ${JSON.stringify(r.data)}`); return r.data; };
@@ -38,5 +44,5 @@ const kstDate = (offsetDays) => new Date(Date.now() + 9 * 3600e3 + offsetDays * 
     console.log(`  관리자  : ${ADMIN.email} / ${ADMIN.password}`);
     console.log(`  강사    : ${INSTRUCTOR.email} / ${INSTRUCTOR.password}`);
     console.log('  수강생  : 이름 김민수 / 전화번호 01011112222 (그 외 이지은 01033334444 등)');
-  } finally { server.close(); }
+  } finally { server.close(); await close(); }
 })().catch((e) => { console.error(e); process.exit(1); });

@@ -8,11 +8,14 @@ const assert = require('node:assert/strict');
 
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'bizup-test-'));
 process.env.DATA_DIR = TMP;
+// 기본은 메모리 Postgres(PGlite). TEST_DATABASE_URL 을 주면 실제 Postgres(빈 DB)에서 실행한다(CI).
+process.env.DATABASE_URL = process.env.TEST_DATABASE_URL || 'pglite:';
+delete process.env.SUPABASE_URL; // 테스트는 항상 로컬 파일 저장소 사용
 process.env.STAFF_SCRYPT_N = '1024';
 process.env.STUDENT_SCRYPT_N = '1024';
 process.env.LOGIN_MAX_FAILURES = '1000';
 
-const { get, all, run, uuid, now } = require('../src/db');
+const { get, run, uuid, now, close, migrate } = require('../src/db');
 const { hashPassword } = require('../src/auth');
 const { setClockOffset } = require('../src/util');
 const { createApp } = require('../src/server');
@@ -43,17 +46,23 @@ async function mkAssignment(chId, { items = ['할 일 1', '할 일 2'], required
   return a;
 }
 async function student(name, phone) { const c = C(); ok(await c.studentLogin(name, phone), 'student login'); return c; }
+async function preview(client, courseId, name, buf) {
+  const f = await client.uploadFile(name, buf, 'roster');
+  if (f.status !== 200) return f;
+  return client.post(`/api/courses/${courseId}/imports/preview`, { file_id: f.data.id });
+}
 const check = (c, a, item, v = true) => c.put(`/api/me/assignments/${a.id}/items/${item.id}`, { is_checked: v });
 
 test.before(async () => {
+  await migrate(); // 실제 Postgres일 때 스키마 적용 (PGlite는 자동)
   server = createApp().listen(0);
   base = `http://127.0.0.1:${server.address().port}`;
   const id = uuid();
-  run(`INSERT INTO staff_accounts(id, email, name, password_hash, status, created_at, updated_at) VALUES(?,?,?,?,?,?,?)`, id, 'admin@t.com', '관리자', await hashPassword('adminpass1'), 'ACTIVE', now(), now());
-  run(`INSERT INTO staff_roles(staff_id, role) VALUES(?, 'ADMIN')`, id);
+  (await run(`INSERT INTO staff_accounts(id, email, name, password_hash, status, created_at, updated_at) VALUES(?,?,?,?,?,?,?)`, id, 'admin@t.com', '관리자', await hashPassword('adminpass1'), 'ACTIVE', now(), now()));
+  (await run(`INSERT INTO staff_roles(staff_id, role) VALUES(?, 'ADMIN')`, id));
   admin = C(); ok(await admin.staffLogin('admin@t.com', 'adminpass1'));
 });
-test.after(() => { server.close(); });
+test.after(async () => { server.close(); await close(); });
 test.afterEach(() => setClockOffset(0));
 
 test('AT-01/02 기수별 별도 강의, 공동 강사 권한 범위', async () => {
@@ -71,12 +80,12 @@ test('AT-03/04/05/06 전화번호 기준 학생 단일화·정규화·동명이�
   const r1 = await enroll(c1.id, '홍길동', '010-2000-0001');
   const r2 = await enroll(c2.id, '홍길동', '+82 10 2000 0001');
   assert.equal(r1.student.id, r2.student.id);
-  assert.equal(get('SELECT COUNT(*) n FROM enrollments WHERE student_id = ?', r1.student.id).n, 2);
+  assert.equal((await get('SELECT COUNT(*) AS n FROM enrollments WHERE student_id = ?', r1.student.id)).n, 2);
   await enroll(c1.id, '홍길동', '01020000002');
   await student('홍길동', '010 2000 0001'); await student('홍길동', '01020000002');
   const conflict = await admin.post(`/api/courses/${c2.id}/enrollments`, { name: '김철수', phone: '01020000001' });
   assert.equal(conflict.status, 409); assert.equal(conflict.data.error.reason, 'NAME_CONFLICT');
-  assert.equal(get('SELECT name FROM students WHERE id = ?', r1.student.id).name, '홍길동');
+  assert.equal((await get('SELECT name FROM students WHERE id = ?', r1.student.id)).name, '홍길동');
   const bad = await C().studentLogin('홍길동', '01099999999');
   assert.equal(bad.status, 401);
   const bad2 = await C().studentLogin('없는사람', '01020000001');
@@ -86,23 +95,23 @@ test('AT-03/04/05/06 전화번호 기준 학생 단일화·정규화·동명이�
 test('AT-07/08/09 명단 업로드: 미리보기 무생성, 재업로드 중복 없음, 비활성 재활성화 필요', async () => {
   const c = await mkCourse('업로드', '1기');
   const csv = '﻿이름,전화번호,수강 등록 메모\n가나다,010-3000-0001,메모1\n라마바,01030000002,\n가나다,01030000001,\n사아자,1030000003,\n,01030000004,\n';
-  const p = ok(await admin.upload(`/api/courses/${c.id}/imports/preview`, 'list.csv', Buffer.from(csv)));
-  assert.equal(get('SELECT COUNT(*) n FROM students WHERE normalized_phone LIKE ?', '0103000%').n, 0);
+  const p = ok(await preview(admin, c.id, 'list.csv', Buffer.from(csv)));
+  assert.equal((await get('SELECT COUNT(*) AS n FROM students WHERE normalized_phone LIKE ?', '0103000%')).n, 0);
   const cls = p.rows.map((r) => r.classification);
   assert.deepEqual(cls, ['NEW', 'NEW', 'DUP_IN_FILE', 'ERROR', 'ERROR']);
   assert.match(p.rows[3].error, /텍스트/);
   ok(await admin.post(`/api/imports/${p.id}/commit`, { idempotency_key: p.id }));
   let job;
-  for (let i = 0; i < 50; i++) { job = ok(await admin.get(`/api/imports/${p.id}`)); if (job.state === 'COMMITTED') break; await new Promise((r) => setTimeout(r, 50)); }
+  for (let i = 0; i < 50; i++) { job = ok(await admin.post(`/api/imports/${p.id}/commit`, {})); if (job.state === 'COMMITTED') break; }
   assert.equal(job.state, 'COMMITTED'); assert.equal(job.result_counts.created, 2);
   const again = ok(await admin.post(`/api/imports/${p.id}/commit`, {}));
   assert.equal(again.state, 'COMMITTED');
-  const enr = get(`SELECT e.id FROM enrollments e JOIN students s ON s.id = e.student_id WHERE e.course_id = ? AND s.normalized_phone = '01030000001'`, c.id);
+  const enr = (await get(`SELECT e.id FROM enrollments e JOIN students s ON s.id = e.student_id WHERE e.course_id = ? AND s.normalized_phone = '01030000001'`, c.id));
   ok(await admin.patch(`/api/enrollments/${enr.id}/status`, { status: 'INACTIVE', reason: '환불' }));
-  const p2 = ok(await admin.upload(`/api/courses/${c.id}/imports/preview`, 'list.csv', Buffer.from(csv)));
+  const p2 = ok(await preview(admin, c.id, 'list.csv', Buffer.from(csv)));
   assert.equal(p2.rows[0].classification, 'NEEDS_REACTIVATION');
   assert.equal(p2.rows[1].classification, 'ALREADY_ENROLLED');
-  assert.equal(get('SELECT COUNT(*) n FROM enrollments WHERE course_id = ?', c.id).n, 2);
+  assert.equal((await get('SELECT COUNT(*) AS n FROM enrollments WHERE course_id = ?', c.id)).n, 2);
 });
 
 test('AT-10/11/12/14 로그인 구분, 로그인 정보 조회 이력, 강사 명단 API 거부', async () => {
@@ -116,10 +125,10 @@ test('AT-10/11/12/14 로그인 구분, 로그인 정보 조회 이력, 강사 �
   assert.match(list.items[0].student.phone, /\*{4}/);
   const rv = ok(await i.client.post(`/api/enrollments/${r.enrollment_id}/login-info/reveal`));
   assert.equal(rv.login_password, '01040000001');
-  assert.ok(get(`SELECT 1 FROM audit_logs WHERE action = 'LOGIN_INFO_REVEALED' AND actor_id = ?`, i.staffId));
+  assert.ok((await get(`SELECT 1 AS ok FROM audit_logs WHERE action = 'LOGIN_INFO_REVEALED' AND actor_id = ?`, i.staffId)));
   ok(await admin.patch(`/api/enrollments/${r.enrollment_id}/status`, { status: 'INACTIVE', reason: '중도탈퇴' }));
   assert.equal((await i.client.post(`/api/enrollments/${r.enrollment_id}/login-info/reveal`)).status, 403);
-  assert.equal((await i.client.upload(`/api/courses/${c.id}/imports/preview`, 'a.csv', Buffer.from('이름,전화번호\n'))).status, 403);
+  assert.equal((await preview(i.client, c.id, 'a.csv', Buffer.from('이름,전화번호\n'))).status, 403);
   assert.equal((await i.client.post(`/api/courses/${c.id}/enrollments`, { name: 'x', phone: '01040000009' })).status, 403);
 });
 
@@ -160,7 +169,7 @@ test('AT-15~21 챌린지·과제 공개·동결', async () => {
   assert.equal(ch3.status, 409);
   const fix = ok(await admin.patch(`/api/assignments/${a.id}`, { version: cur.version, title: '과제(오탈자 수정)', items: cur.items }));
   assert.equal(fix.title, '과제(오탈자 수정)');
-  assert.ok(get(`SELECT 1 FROM audit_logs WHERE target_id = ? AND action = 'ASSIGNMENT_UPDATED_AFTER_LOCK'`, a.id));
+  assert.ok((await get(`SELECT 1 AS ok FROM audit_logs WHERE target_id = ? AND action = 'ASSIGNMENT_UPDATED_AFTER_LOCK'`, a.id)));
   const stale = await admin.patch(`/api/assignments/${a.id}`, { version: cur.version, title: 'x' });
   assert.equal(stale.status, 409); assert.equal(stale.data.error.reason, 'VERSION_CONFLICT');
   assert.equal((await admin.post(`/api/assignments/${a.id}/unpublish`)).status, 409);
@@ -173,7 +182,7 @@ test('AT-22/23/24 과제 복사: 새 초안, 독립 자료, 권한 검사', asyn
   const chS = await mkChallenge(src.id); const chD = await mkChallenge(dst.id);
   await enroll(src.id, '원본생', '01070000001'); await enroll(dst.id, '대상생', '01070000002');
   const a = await mkAssignment(chS.id, { required: true });
-  const up = ok(await admin.upload('/api/files', 'guide.pdf', Buffer.from('%PDF-1.4 test')));
+  const up = ok(await admin.uploadFile('guide.pdf', Buffer.from('%PDF-1.4 test')));
   ok(await admin.post(`/api/assignments/${a.id}/resources`, { type: 'FILE', file_id: up.id }));
   ok(await check(await student('원본생', '01070000001'), a, a.items[0]));
   assert.equal((await i.client.post(`/api/assignments/${a.id}/copy`, { target_challenge_id: chD.id })).status, 404);
@@ -207,9 +216,9 @@ test('AT-26~33 자동 완료·제출 필수·완료 취소', async () => {
   v = ok(await s.get(`/api/me/assignments/${req.id}`)); assert.equal(v.status, 'NEED_SUBMISSION'); assert.ok(v.hint);
   const bad = await s.post(`/api/me/assignments/${req.id}/submissions`, { type: 'LINK', url: 'javascript:alert(1)' });
   assert.equal(bad.status, 400);
-  const pending = ok(await s.upload('/api/files', 'a.png', Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2])));
+  const pending = ok(await s.uploadFile('a.png', Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2])));
   v = ok(await s.get(`/api/me/assignments/${req.id}`)); assert.equal(v.status, 'NEED_SUBMISSION'); // 업로드만 된 파일은 제출로 세지 않음
-  const fake = await s.upload('/api/files', 'evil.pdf', Buffer.from('MZ not a pdf'));
+  const fake = await s.uploadFile('evil.pdf', Buffer.from('MZ not a pdf'));
   assert.equal(fake.status, 400);
   v = ok(await s.post(`/api/me/assignments/${req.id}/submissions`, { type: 'FILE', file_id: pending.id }));
   assert.equal(v.status, 'COMPLETED');
@@ -219,7 +228,7 @@ test('AT-26~33 자동 완료·제출 필수·완료 취소', async () => {
   v = ok(await s.del(`/api/me/submissions/${v.submissions[0].id}`)); assert.equal(v.status, 'COMPLETED');
   v = ok(await s.del(`/api/me/submissions/${v.submissions[0].id}`)); assert.equal(v.status, 'NEED_SUBMISSION');
   v = ok(await check(s, opt, opt.items[0], false)); assert.equal(v.status, 'IN_PROGRESS');
-  const ev = get(`SELECT COUNT(*) n FROM progress_events pe JOIN task_progress tp ON tp.id = pe.task_progress_id WHERE tp.assignment_id = ? AND pe.event_type = 'UNCOMPLETED'`, opt.id).n;
+  const ev = (await get(`SELECT COUNT(*) AS n FROM progress_events pe JOIN task_progress tp ON tp.id = pe.task_progress_id WHERE tp.assignment_id = ? AND pe.event_type = 'UNCOMPLETED'`, opt.id)).n;
   assert.equal(ev, 1);
   const forged = await s.put(`/api/me/assignments/${opt.id}/items/${opt.items[0].id}`, { is_checked: 'true', is_completed: true });
   assert.equal(forged.status, 400);
@@ -290,7 +299,7 @@ test('AT-42~48 등록 비활성화 범위, 권한 우회 차단, 빈 집계, 진
   await enroll(c1.id, '타인', '01022220002');
   const ch = await mkChallenge(c1.id); const a = await mkAssignment(ch.id);
   const me = await student('권한생', '01022220001'); const other = await student('타인', '01022220002');
-  const f = ok(await me.upload('/api/files', 'note.txt', Buffer.from('hello')));
+  const f = ok(await me.uploadFile('note.txt', Buffer.from('hello')));
   ok(await me.post(`/api/me/assignments/${a.id}/submissions`, { type: 'FILE', file_id: f.id }));
   assert.equal((await other.get(`/api/files/${f.id}/download`)).status, 404);
   assert.equal((await C().get(`/api/files/${f.id}/download`)).status, 401);
@@ -333,11 +342,11 @@ test('AT-50/52/53 권한 회수·세션 회수·멱등·충돌', async () => {
   const ch = await mkChallenge(c.id); const a = await mkAssignment(ch.id);
   const s = await student('멱등', '01044440001');
   ok(await check(s, a, a.items[0])); ok(await check(s, a, a.items[0])); ok(await check(s, a, a.items[0]));
-  assert.equal(get(`SELECT COUNT(*) n FROM progress_events pe JOIN task_progress tp ON tp.id = pe.task_progress_id WHERE tp.assignment_id = ? AND event_type = 'CHECKED'`, a.id).n, 1);
+  assert.equal((await get(`SELECT COUNT(*) AS n FROM progress_events pe JOIN task_progress tp ON tp.id = pe.task_progress_id WHERE tp.assignment_id = ? AND event_type = 'CHECKED'`, a.id)).n, 1);
   const key = 'sub-1';
   ok(await s.post(`/api/me/assignments/${a.id}/submissions`, { type: 'LINK', url: 'https://x.example.com', idempotency_key: key }));
   ok(await s.post(`/api/me/assignments/${a.id}/submissions`, { type: 'LINK', url: 'https://x.example.com', idempotency_key: key }));
-  assert.equal(get('SELECT COUNT(*) n FROM submissions WHERE assignment_id = ?', a.id).n, 1);
+  assert.equal((await get('SELECT COUNT(*) AS n FROM submissions WHERE assignment_id = ?', a.id)).n, 1);
   const chv = ok(await i.client.get(`/api/courses/${c.id}/challenges`)).items[0];
   ok(await admin.patch(`/api/challenges/${ch.id}`, { version: chv.version, title: '관리자 수정' }));
   const conflict = await i.client.patch(`/api/challenges/${ch.id}`, { version: chv.version, title: '강사 수정' });
@@ -347,7 +356,7 @@ test('AT-50/52/53 권한 회수·세션 회수·멱등·충돌', async () => {
   ok(await i.client.get('/api/courses'));
   ok(await admin.patch(`/api/staff/${i.staffId}`, { status: 'DISABLED' }));
   assert.equal((await i.client.get('/api/courses')).status, 401);
-  const lastAdmin = get(`SELECT id FROM staff_accounts WHERE email = 'admin@t.com'`).id;
+  const lastAdmin = (await get(`SELECT id FROM staff_accounts WHERE email = 'admin@t.com'`)).id;
   assert.equal((await admin.patch(`/api/staff/${lastAdmin}`, { status: 'DISABLED' })).status, 409);
 });
 
@@ -363,10 +372,57 @@ test('XLSX 업로드: 숫자형 전화번호(앞자리 0 유실)는 오류 행, 
   const ws = XLSX.utils.aoa_to_sheet([['성명', '휴대폰'], ['엑셀1', '010-5555-0001'], ['엑셀2', 1055550002]]);
   const wb = XLSX.utils.book_new(); XLSX.utils.book_append_sheet(wb, ws, '명단');
   const buf = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
-  const p = ok(await admin.upload(`/api/courses/${c.id}/imports/preview`, 'list.xlsx', buf));
+  const p = ok(await preview(admin, c.id, 'list.xlsx', buf));
   assert.equal(p.mapping.name, 0); assert.equal(p.mapping.phone, 1);
   assert.deepEqual(p.rows.map((r) => r.classification), ['NEW', 'ERROR']);
   assert.match(p.rows[1].error, /텍스트/);
-  const xls = await admin.upload(`/api/courses/${c.id}/imports/preview`, 'old.xls', Buffer.from('x'));
+  const xls = await preview(admin, c.id, 'old.xls', Buffer.from('x'));
   assert.equal(xls.status, 400); assert.match(xls.data.error.message, /xlsx/);
+});
+
+test('동시성: 첫 수행과 강사 수정 동시 요청, 동일 체크 동시 재전송, 동시 등록', async () => {
+  const c = await mkCourse('동시성', '1기');
+  await enroll(c.id, '동시1', '01066660001');
+  const ch = await mkChallenge(c.id); const a = await mkAssignment(ch.id, { items: ['a', 'b'] });
+  const s = await student('동시1', '01066660001');
+  const cur = ok(await admin.get(`/api/assignments/${a.id}`));
+  // 학생 첫 체크와 강사의 할 일 변경이 동시에 도착: 어느 쪽이 먼저든 동결 후 변경은 허용되지 않아야 한다
+  const [chk, edit] = await Promise.all([
+    check(s, a, a.items[0]),
+    admin.patch(`/api/assignments/${a.id}`, { version: cur.version, items: [...cur.items, { title: 'c' }] }),
+  ]);
+  const after = ok(await admin.get(`/api/assignments/${a.id}`));
+  if (chk.status === 200 && edit.status === 200) {
+    // 강사 수정이 먼저 커밋된 경우: 학생 체크는 수정된 과제(할 일 3개)에 대해 이루어지고 이후 동결
+    assert.equal(after.items.length, 3);
+  } else {
+    assert.equal(edit.status, 409); assert.equal(after.items.length, 2);
+  }
+  assert.ok(after.locked_at);
+  // 같은 체크 요청 동시 재전송 → CHECKED 사건 1건
+  await Promise.all([1, 2, 3, 4].map(() => check(s, a, a.items[1])));
+  const n = (await get(`SELECT COUNT(*) AS n FROM progress_events pe JOIN task_progress tp ON tp.id = pe.task_progress_id
+    WHERE tp.assignment_id = ? AND pe.event_type = 'CHECKED' AND pe.item_id_optional = ?`, a.id, a.items[1].id)).n;
+  assert.equal(n, 1);
+  // 같은 학생을 같은 강의에 동시 등록 → 1건만 생성
+  const rs = await Promise.all([1, 2, 3].map(() => admin.post(`/api/courses/${c.id}/enrollments`, { name: '동시2', phone: '01066660002' })));
+  assert.equal(rs.filter((x) => x.status === 201).length, 1);
+  assert.ok(rs.every((x) => x.status === 201 || x.status === 409));
+  assert.equal((await get(`SELECT COUNT(*) AS n FROM students WHERE normalized_phone = '01066660002'`)).n, 1);
+});
+
+test('정리 작업 엔드포인트는 CRON_SECRET 없이는 숨김, 검증 실패 업로드는 저장소에서 삭제', async () => {
+  assert.equal((await C().get('/api/cron/cleanup')).status, 404);
+  process.env.CRON_SECRET = 'test-secret';
+  const r = await C().req('GET', '/api/cron/cleanup', undefined, { headers: { authorization: 'Bearer test-secret' } });
+  assert.equal(r.status, 200);
+  delete process.env.CRON_SECRET;
+  const bad = await admin.uploadFile('fake.png', Buffer.from('not a png'));
+  assert.equal(bad.status, 400);
+  const f = await get(`SELECT * FROM file_assets WHERE original_name = 'fake.png' ORDER BY created_at DESC LIMIT 1`);
+  assert.equal(f.status, 'DELETED');
+  assert.equal(fs.existsSync(path.join(TMP, 'objects', f.object_key)), false);
+  // 미완료(PENDING) 파일은 제출에 사용할 수 없음
+  const prep = ok(await admin.post('/api/files/prepare', { name: 'x.pdf', size: 10 }));
+  assert.equal((await admin.get(`/api/files/${prep.id}/download`)).status, 404);
 });

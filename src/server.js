@@ -1,19 +1,21 @@
 'use strict';
 const express = require('express');
 const path = require('path');
-const fs = require('fs');
 const crypto = require('crypto');
-const { get, all } = require('./db');
-const { E, AppError, serverNow, setClockOffset } = require('./util');
+const { get } = require('./db');
+const { E, AppError, serverNow, setClockOffset, str } = require('./util');
 const A = require('./auth');
 const F = require('./files');
 const AC = require('./access');
-const courses = require('./routes/courses');
+const { storage } = require('./storage');
+
+const ON_VERCEL = !!process.env.VERCEL;
 
 function createApp() {
   const app = express();
   app.disable('x-powered-by');
-  app.set('trust proxy', process.env.TRUST_PROXY === '1');
+  // Vercel은 프록시 뒤에서 실행되므로 X-Forwarded-For 의 클라이언트 IP를 신뢰한다(로그인 시도 제한용).
+  app.set('trust proxy', process.env.TRUST_PROXY ? process.env.TRUST_PROXY === '1' : ON_VERCEL);
 
   app.use((req, res, next) => {
     req.requestId = crypto.randomBytes(6).toString('hex');
@@ -23,11 +25,32 @@ function createApp() {
     res.setHeader('Referrer-Policy', 'same-origin');
     next();
   });
+
+  // 정기 정리 작업(Vercel Cron): CRON_SECRET 으로만 호출 가능. 세션 미들웨어보다 먼저 둔다.
+  app.get('/api/cron/cleanup', async (req, res) => {
+    const secret = process.env.CRON_SECRET;
+    if (!secret || req.get('authorization') !== `Bearer ${secret}`) throw E.notFound();
+    res.json(await F.cleanupTemporaryUploads());
+  });
+
+  // 로컬 저장소 전용 업로드 수신 (Supabase Storage 사용 시에는 브라우저가 저장소로 직접 전송)
+  app.put('/api/files/:id/upload', express.raw({ type: () => true, limit: F.LIMITS.attachmentBytes + 1024 }), A.sessionMiddleware, A.requireUser, async (req, res) => {
+    const s = storage();
+    if (s.kind !== 'local') throw E.notFound();
+    const f = await F.loadOwnPending(req.user, req.params.id);
+    if (f.status !== 'PENDING') throw E.invalid('이미 처리된 업로드입니다.');
+    await s.write(f.object_key, Buffer.isBuffer(req.body) ? req.body : Buffer.alloc(0));
+    res.json({ ok: true });
+  });
+
   app.use(express.json({ limit: '1mb' }));
   app.use('/api', A.sessionMiddleware);
   app.use('/api', (req, res, next) => { res.setHeader('Cache-Control', 'no-store'); next(); });
 
-  app.get('/api/health', (req, res) => res.json({ ok: true, server_time: serverNow().toISOString() }));
+  app.get('/api/health', async (req, res) => {
+    await get('SELECT 1 AS ok');
+    res.json({ ok: true, server_time: serverNow().toISOString(), storage: storage().kind });
+  });
   app.get('/api/me', (req, res) => {
     if (!req.user) return res.json({ user: null });
     res.json({ user: req.user, csrf_token: req.session.csrf_token, server_time: serverNow().toISOString() });
@@ -36,45 +59,47 @@ function createApp() {
   app.use('/api/auth', require('./routes/auth'));
   app.use('/api/me', require('./routes/student'));
   app.use('/api', require('./routes/admin'));
-  app.use('/api', courses);
+  app.use('/api', require('./routes/courses'));
   app.use('/api', require('./routes/challenges'));
   app.use('/api', require('./routes/staffProgress'));
 
-  // 파일 업로드(전송 준비)와 제출 확정은 분리한다.
-  app.post('/api/files', A.requireUser, F.uploadAttachment, (req, res) => {
-    const purpose = req.user.type === 'STUDENT' ? 'submission' : 'resource';
-    const f = F.store(req.file, { types: F.ATTACHMENT_TYPES, maxBytes: F.LIMITS.attachmentBytes, purpose, user: req.user });
-    res.status(201).json(f);
+  // 파일 전송 준비와 업로드 완료 확정을 분리한다 (16.2). 제출·자료 연결은 각 API에서 다시 검사한다.
+  app.post('/api/files/prepare', A.requireUser, async (req, res) => {
+    let purpose = req.user.type === 'STUDENT' ? 'submission' : 'resource';
+    if (req.body.purpose === 'roster') {
+      if (!(req.user.type === 'STAFF' && req.user.isAdmin)) throw E.forbidden();
+      purpose = 'roster';
+    }
+    res.status(201).json(await F.prepare(req.user, { name: str(req.body.name, 300), size: req.body.size, purpose }));
   });
-  app.get('/api/files/:id/download', A.requireUser, (req, res) => {
-    const f = get('SELECT * FROM file_assets WHERE id = ?', req.params.id);
-    if (!f || f.status === 'DELETED' || f.purpose === 'roster' && !(req.user.type === 'STAFF' && req.user.isAdmin)) throw E.notFound();
-    if (!AC.canDownloadFile(req.user, f.id)) throw E.notFound();
-    const p = F.objectPath(f);
-    if (!fs.existsSync(p)) throw E.notFound();
+  app.post('/api/files/:id/complete', A.requireUser, async (req, res) => {
+    res.json(await F.complete(req.user, req.params.id));
+  });
+  app.get('/api/files/:id/download', A.requireUser, async (req, res) => {
+    const f = await get('SELECT * FROM file_assets WHERE id = ?', req.params.id);
+    if (!f || f.status === 'DELETED' || f.status === 'PENDING' || f.purpose === 'roster') throw E.notFound();
+    if (!(await AC.canDownloadFile(req.user, f.id))) throw E.notFound();
     const inline = req.query.inline === '1' && /^image\/(png|jpeg|webp)$/.test(f.content_type);
-    res.setHeader('Content-Type', f.content_type);
-    res.setHeader('Content-Security-Policy', "default-src 'none'; img-src 'self'; style-src 'unsafe-inline'; sandbox");
-    res.setHeader('Content-Disposition', `${inline ? 'inline' : 'attachment'}; filename*=UTF-8''${encodeURIComponent(f.original_name)}`);
-    res.setHeader('Cache-Control', 'private, no-store');
-    fs.createReadStream(p).pipe(res);
+    await storage().sendDownload(res, f, inline);
   });
 
-  // 검수 환경 전용: 서버 시각 조정 (ENABLE_TEST_CLOCK=1 일 때만)
-  if (process.env.ENABLE_TEST_CLOCK === '1') {
+  // 검수 환경 전용: 서버 시각 조정 (ENABLE_TEST_CLOCK=1 이고 Vercel 운영 환경이 아닐 때만)
+  if (process.env.ENABLE_TEST_CLOCK === '1' && process.env.VERCEL_ENV !== 'production') {
     app.post('/api/test/clock', (req, res) => { setClockOffset(Number(req.body.offset_ms) || 0); res.json({ now: serverNow().toISOString() }); });
   }
 
   app.use('/api', (req, res, next) => next(E.notFound('요청한 API를 찾을 수 없습니다.')));
+  // 로컬 실행 시 정적 파일 제공 (Vercel에서는 public/ 을 CDN이 직접 제공)
   app.use(express.static(path.join(__dirname, '..', 'public'), { index: 'index.html', maxAge: 0 }));
-  app.get(/^\/(?!api\/).*/, (req, res) => res.sendFile(path.join(__dirname, '..', 'public', 'index.html')));
 
   // 오류 응답: 요청 추적 ID와 사용자용 메시지. DB 구조·내부 경로는 노출하지 않는다.
   // eslint-disable-next-line no-unused-vars
   app.use((err, req, res, next) => {
     if (err.type === 'entity.parse.failed') err = E.invalid('요청 형식이 올바르지 않습니다.');
+    if (err.type === 'entity.too.large') err = E.invalid('파일 크기 한도를 초과했습니다.');
     if (!(err instanceof AppError)) {
-      if (/UNIQUE constraint failed/.test(err.message || '')) err = E.conflict('이미 처리된 요청이거나 중복된 정보입니다. 새로고침 후 확인해주세요.');
+      if (err.code === '23505') err = E.conflict('이미 처리된 요청이거나 중복된 정보입니다. 새로고침 후 확인해주세요.');
+      else if (err.code === '40P01' || err.code === '40001') err = E.conflict('다른 변경과 겹쳤습니다. 잠시 후 다시 시도해주세요.');
       else {
         console.error(`[${req.requestId}]`, err);
         err = new AppError(500, 'INTERNAL', '일시적인 오류가 발생했습니다. 잠시 후 다시 시도해주세요.');
@@ -85,14 +110,11 @@ function createApp() {
   return app;
 }
 
+// 로컬 실행 시 주기 작업 (Vercel에서는 vercel.json 의 Cron이 /api/cron/cleanup 을 호출)
 function startBackground() {
-  // 서버 재시작 시 확정 중이던 명단 처리를 이어서 수행 (이미 등록된 행은 중복 생성되지 않음)
-  for (const j of all(`SELECT id, uploaded_by FROM import_jobs WHERE state = 'COMMITTING'`)) {
-    const a = get('SELECT id, name FROM staff_accounts WHERE id = ?', j.uploaded_by);
-    courses.processCommit({ user: { type: 'STAFF', id: a.id, name: a.name } }, j.id).catch((e) => console.error(e));
-  }
-  F.cleanupTemporaryUploads();
-  setInterval(() => { try { F.cleanupTemporaryUploads(); } catch (e) { console.error(e); } }, 3600 * 1000).unref();
+  const tick = () => F.cleanupTemporaryUploads().catch((e) => console.error('cleanup failed', e.message));
+  tick();
+  setInterval(tick, 3600 * 1000).unref();
 }
 
 // 다른 프로그램이 이미 응답 중인 포트인지 확인한다.
@@ -128,9 +150,10 @@ async function startServer(preferredPort, maxTries = 20) {
 }
 
 if (require.main === module) {
-  startServer(Number(process.env.PORT || 3000)).then(({ port }) => {
+  startServer(Number(process.env.PORT || 3000)).then(async ({ port }) => {
     console.log(`비즈업클래스 챌린지 관리 서비스: http://localhost:${port}`);
-    if (!get(`SELECT 1 FROM staff_roles WHERE role = 'ADMIN'`)) {
+    console.log(`DB: ${process.env.DATABASE_URL && !process.env.DATABASE_URL.startsWith('pglite:') ? 'Postgres(DATABASE_URL)' : 'PGlite(로컬)'} · 파일 저장소: ${storage().kind}`);
+    if (!(await get(`SELECT 1 AS ok FROM staff_roles WHERE role = 'ADMIN'`))) {
       console.log('관리자 계정이 없습니다. `npm run init-admin -- --email you@example.com --name 관리자` 로 최초 관리자를 만드세요.');
     }
     startBackground();

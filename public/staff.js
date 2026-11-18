@@ -187,8 +187,8 @@ async function courseStudents(el, c, q) {
       <p class="form-error small" style="color:var(--danger)"></p>
       <div class="actions"><button type="button" class="btn" data-close>취소</button><button class="btn primary" type="submit">미리보기</button></div></form>`);
     bindForm($('#uf', m.el), async (_d, form) => {
-      const fd = new FormData(); fd.append('file', form.file.files[0]);
-      const job = await api('POST', `/api/courses/${c.id}/imports/preview`, undefined, { form: fd });
+      const f = await uploadFile(form.file.files[0], 'roster');
+      const job = await POST(`/api/courses/${c.id}/imports/preview`, { file_id: f.id });
       m.close(); location.hash = '#/a/import/' + job.id;
     });
   });
@@ -231,7 +231,7 @@ route('/a/import/:id', async ({ id }, q) => {
       <button class="btn" type="submit">다시 검사</button></form>
       ${job.mapping.name == null || job.mapping.phone == null ? '<p class="notice warn mt small">이름·전화번호 열을 선택한 뒤 다시 검사해주세요.</p>' : ''}</div>` : ''}
     ${committed && job.result_counts ? `<div class="card"><h3>처리 결과</h3><div class="row">${Object.entries(job.result_counts).map(([k, v]) => `<span class="badge ${RESULT[k.toUpperCase()][1]}">${RESULT[k.toUpperCase()][0]} ${v}</span>`).join('')}</div></div>` : ''}
-    ${job.state === 'COMMITTING' ? '<p class="notice">명단을 등록하는 중입니다. 이 화면을 떠나도 처리는 계속되며 나중에 결과를 다시 확인할 수 있습니다.</p>' : ''}
+    ${job.state === 'COMMITTING' ? `<p class="notice">명단을 등록하는 중입니다… (${job.progress.processed}/${job.progress.total}행) 이 화면을 떠났다가 돌아오면 남은 행부터 이어서 처리합니다.</p>` : ''}
     <div class="card"><div class="row between"><div class="row">${Object.entries(job.preview_counts).map(([k, v]) => `<a class="badge ${CLS[k][1]}" href="#/a/import/${id}?f=${k}">${CLS[k][0]} ${v}</a>`).join('')}
       <a class="badge" href="#/a/import/${id}?f=ISSUE">확인 필요만</a><a class="badge" href="#/a/import/${id}">전체</a></div>
       ${job.state === 'PREVIEW' ? `<button class="btn primary" id="commit" ${job.committable ? '' : 'disabled'}>${job.committable}건 등록 확정</button>` : ''}</div>
@@ -242,7 +242,15 @@ route('/a/import/:id', async ({ id }, q) => {
       ${committed ? `<td>${r.result ? `<span class="badge ${RESULT[r.result][1]}">${RESULT[r.result][0]}</span> <span class="small muted">${esc(r.result_message || '')}</span>` : ''}</td>`
     : job.state === 'PREVIEW' ? `<td class="num"><button class="btn sm" data-edit="${r.row_number}">수정</button> <button class="btn sm" data-excl="${r.row_number}" data-v="${r.excluded ? 0 : 1}">${r.excluded ? '포함' : '제외'}</button></td>` : '<td></td>'}</tr>`).join('')
       || '<tr><td colspan="7" class="center muted">표시할 행이 없습니다.</td></tr>'}</tbody></table></div>`;
-  if (job.state === 'COMMITTING') { setTimeout(() => { if (location.hash.startsWith('#/a/import/' + id)) rerender(); }, 1500); return; }
+  // 서버리스 실행 시간 제한 때문에 서버는 호출마다 일부 행만 처리한다. 화면에 머무는 동안 이어서 요청한다(멱등).
+  if (job.state === 'COMMITTING') {
+    setTimeout(async () => {
+      if (!location.hash.startsWith('#/a/import/' + id)) return;
+      try { await POST(`/api/imports/${id}/commit`, { idempotency_key: id }); } catch (e) { toast(errMsg(e), true); }
+      rerender();
+    }, 300);
+    return;
+  }
   if (job.state !== 'PREVIEW') return;
   $('#mf').addEventListener('submit', async (e) => {
     e.preventDefault(); const d = formData(e.target);

@@ -67,10 +67,24 @@ const POST = (p, b = {}) => api('POST', p, b);
 const PUT = (p, b = {}) => api('PUT', p, b);
 const PATCH = (p, b = {}) => api('PATCH', p, b);
 const DEL = (p) => api('DELETE', p);
-async function uploadFile(file) {
-  const fd = new FormData();
-  fd.append('file', file);
-  return api('POST', '/api/files', undefined, { form: fd });
+// 업로드: 서버에 전송 준비 요청 → 저장소로 직접 전송 → 서버가 내용 검증 후 확정
+async function uploadFile(file, purpose) {
+  const prep = await POST('/api/files/prepare', { name: file.name, size: file.size, purpose });
+  if (file.size > prep.max_bytes) throw new ApiError(400, { error: { message: `파일 크기는 최대 ${Math.round(prep.max_bytes / 1048576)}MB입니다.` } });
+  let res;
+  try {
+    if (prep.upload.type === 'local') {
+      res = await fetch(prep.upload.url, { method: 'PUT', headers: { 'x-csrf-token': CSRF, 'content-type': 'application/octet-stream' }, body: file, credentials: 'same-origin' });
+    } else {
+      // Supabase Storage 서명 업로드 URL (일회성 토큰 포함)
+      const fd = new FormData();
+      fd.append('cacheControl', '3600');
+      fd.append('', file);
+      res = await fetch(prep.upload.url, { method: 'PUT', headers: { 'x-upsert': 'false' }, body: fd });
+    }
+  } catch (_) { res = null; }
+  if (!res || !res.ok) throw new ApiError(0, { error: { message: '파일이 등록되지 않았습니다. 다시 시도해주세요.' } });
+  return POST(`/api/files/${prep.id}/complete`);
 }
 function qs(obj) {
   const p = new URLSearchParams();

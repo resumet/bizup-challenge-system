@@ -3,7 +3,7 @@
 const { get, all, run, uuid } = require('./db');
 const { E, serverNow, pct } = require('./util');
 
-// 8.3 상태별 학생 동작 판단 (최신 챌린지 기간·설정 기준)
+// 8.3 상태별 학생 동작 판단 (최신 챌린지 기간·설정 기준, DB 조회 없음)
 function actionState(challenge, assignment, enrollment) {
   if (!enrollment || enrollment.status !== 'ACTIVE') return { canAct: false, code: 'NO_ACCESS', message: '이 강의에 접근할 수 없습니다. 운영자에게 문의해주세요.' };
   if (challenge.visibility !== 'PUBLISHED' || assignment.visibility !== 'PUBLISHED') return { canAct: false, code: 'DRAFT', message: '공개되지 않은 과제입니다.' };
@@ -21,53 +21,49 @@ function assertCanAct(challenge, assignment, enrollment) {
   return s;
 }
 
-function ensureTaskProgress(enrollment, assignment) {
-  let tp = get('SELECT * FROM task_progress WHERE enrollment_id = ? AND assignment_id = ?', enrollment.id, assignment.id);
-  if (!tp) {
-    run(`INSERT INTO task_progress(id, course_id, enrollment_id, assignment_id) VALUES(?,?,?,?)`,
-      uuid(), assignment.course_id, enrollment.id, assignment.id);
-    tp = get('SELECT * FROM task_progress WHERE enrollment_id = ? AND assignment_id = ?', enrollment.id, assignment.id);
-  }
-  return tp;
+async function ensureTaskProgress(enrollment, assignment) {
+  await run(`INSERT INTO task_progress(id, course_id, enrollment_id, assignment_id) VALUES(?,?,?,?)
+    ON CONFLICT (enrollment_id, assignment_id) DO NOTHING`, uuid(), assignment.course_id, enrollment.id, assignment.id);
+  return get('SELECT * FROM task_progress WHERE enrollment_id = ? AND assignment_id = ? FOR UPDATE', enrollment.id, assignment.id);
 }
 
 // 첫 수행 확정 시 과제 동결 + 학생 기록 시작 시각
-function markStarted(tp, assignment, at) {
-  if (!tp.started_at) run('UPDATE task_progress SET started_at = ? WHERE id = ?', at, tp.id);
-  run('UPDATE assignments SET locked_at = ? WHERE id = ? AND locked_at IS NULL', at, assignment.id);
+async function markStarted(tp, assignment, at) {
+  if (!tp.started_at) await run('UPDATE task_progress SET started_at = ? WHERE id = ? AND started_at IS NULL', at, tp.id);
+  await run('UPDATE assignments SET locked_at = ? WHERE id = ? AND locked_at IS NULL', at, assignment.id);
 }
 
-function counts(tpId, assignmentId) {
-  const items = get('SELECT COUNT(*) n FROM checklist_items WHERE assignment_id = ?', assignmentId).n;
-  const checked = tpId ? get('SELECT COUNT(*) n FROM item_progress WHERE task_progress_id = ? AND is_checked = 1', tpId).n : 0;
+async function counts(tpId, assignmentId) {
+  const items = (await get('SELECT COUNT(*) AS n FROM checklist_items WHERE assignment_id = ?', assignmentId)).n;
+  const checked = tpId ? (await get('SELECT COUNT(*) AS n FROM item_progress WHERE task_progress_id = ? AND is_checked = 1', tpId)).n : 0;
   return { items, checked };
 }
-function currentSubmissionCount(enrollmentId, assignmentId) {
+async function currentSubmissionCount(enrollmentId, assignmentId) {
   // READY 상태이며 현재 버전 파일이 정상 연결(ATTACHED)된 경우만 센다.
-  return get(`SELECT COUNT(*) n FROM submissions s JOIN submission_versions v ON v.submission_id = s.id AND v.revision = s.current_revision
+  return (await get(`SELECT COUNT(*) AS n FROM submissions s JOIN submission_versions v ON v.submission_id = s.id AND v.revision = s.current_revision
     LEFT JOIN file_assets f ON f.id = v.file_id_optional
     WHERE s.enrollment_id = ? AND s.assignment_id = ? AND s.status = 'READY'
-      AND (v.type = 'LINK' OR f.status = 'ATTACHED')`, enrollmentId, assignmentId).n;
+      AND (v.type = 'LINK' OR f.status = 'ATTACHED')`, enrollmentId, assignmentId)).n;
 }
 
 // 서버가 원천 데이터로 완료 여부를 다시 계산한다(트랜잭션 내부에서 호출).
-function recompute(tpId) {
-  const tp = get('SELECT * FROM task_progress WHERE id = ?', tpId);
-  const a = get('SELECT * FROM assignments WHERE id = ?', tp.assignment_id);
-  const ch = get('SELECT * FROM challenges WHERE id = ?', a.challenge_id);
-  const { items, checked } = counts(tp.id, a.id);
-  const subs = currentSubmissionCount(tp.enrollment_id, a.id);
+async function recompute(tpId) {
+  const tp = await get('SELECT * FROM task_progress WHERE id = ?', tpId);
+  const a = await get('SELECT * FROM assignments WHERE id = ?', tp.assignment_id);
+  const ch = await get('SELECT * FROM challenges WHERE id = ?', a.challenge_id);
+  const { items, checked } = await counts(tp.id, a.id);
+  const subs = await currentSubmissionCount(tp.enrollment_id, a.id);
   const complete = items >= 1 && checked === items && (!a.submission_required || subs >= 1);
   const at = serverNow().toISOString();
   if (complete && !tp.is_completed) {
     const timing = Date.parse(at) < Date.parse(ch.deadline_at) ? 'ON_TIME' : 'LATE';
-    run(`UPDATE task_progress SET is_completed = 1, completed_at = ?, completed_deadline_at = ?, completion_timing = ?, version = version + 1 WHERE id = ?`,
+    await run(`UPDATE task_progress SET is_completed = 1, completed_at = ?, completed_deadline_at = ?, completion_timing = ?, version = version + 1 WHERE id = ?`,
       at, ch.deadline_at, timing, tp.id);
-    run(`INSERT INTO progress_events(task_progress_id, event_type, occurred_at, metadata) VALUES(?,?,?,?)`,
+    await run(`INSERT INTO progress_events(task_progress_id, event_type, occurred_at, metadata) VALUES(?,?,?,?)`,
       tp.id, 'COMPLETED', at, JSON.stringify({ deadline_at: ch.deadline_at, timing }));
   } else if (!complete && tp.is_completed) {
-    run(`UPDATE task_progress SET is_completed = 0, completed_at = NULL, completed_deadline_at = NULL, completion_timing = NULL, version = version + 1 WHERE id = ?`, tp.id);
-    run(`INSERT INTO progress_events(task_progress_id, event_type, occurred_at, metadata) VALUES(?,?,?,?)`,
+    await run(`UPDATE task_progress SET is_completed = 0, completed_at = NULL, completed_deadline_at = NULL, completion_timing = NULL, version = version + 1 WHERE id = ?`, tp.id);
+    await run(`INSERT INTO progress_events(task_progress_id, event_type, occurred_at, metadata) VALUES(?,?,?,?)`,
       tp.id, 'UNCOMPLETED', at, JSON.stringify({ previous_completed_at: tp.completed_at }));
   }
   return get('SELECT * FROM task_progress WHERE id = ?', tp.id);
@@ -91,27 +87,26 @@ function publishedAssignments(courseId, challengeId = null) {
       c.starts_at, c.deadline_at, c.sort_order AS ch_sort,
       (SELECT COUNT(*) FROM checklist_items i WHERE i.assignment_id = a.id) AS item_count
     FROM assignments a JOIN challenges c ON c.id = a.challenge_id
-    WHERE a.course_id = ? AND a.visibility = 'PUBLISHED' AND c.visibility = 'PUBLISHED' AND (? IS NULL OR c.id = ?)
+    WHERE a.course_id = ? AND a.visibility = 'PUBLISHED' AND c.visibility = 'PUBLISHED' AND (?::text IS NULL OR c.id = ?)
     ORDER BY c.sort_order, c.start_date, c.created_at, a.sort_order, a.created_at`, courseId, challengeId, challengeId);
 }
 
 // 수강 등록 집합의 과제별 셀 상태 (진행 행이 없어도 미시작으로 보완)
-function cellMatrix(courseId, enrollmentIds, assignments) {
+async function cellMatrix(courseId, enrollmentIds, assignments) {
   const map = new Map();
   if (!enrollmentIds.length || !assignments.length) return map;
-  const ph = enrollmentIds.map(() => '?').join(',');
-  const tps = all(`SELECT tp.*, (SELECT COUNT(*) FROM item_progress ip WHERE ip.task_progress_id = tp.id AND ip.is_checked = 1) AS checked
-    FROM task_progress tp WHERE tp.course_id = ? AND tp.enrollment_id IN (${ph})`, courseId, ...enrollmentIds);
-  const subs = all(`SELECT s.enrollment_id, s.assignment_id, COUNT(*) n FROM submissions s
+  const tps = await all(`SELECT tp.*, (SELECT COUNT(*) FROM item_progress ip WHERE ip.task_progress_id = tp.id AND ip.is_checked = 1) AS checked
+    FROM task_progress tp WHERE tp.course_id = ? AND tp.enrollment_id = ANY(?::text[])`, courseId, enrollmentIds);
+  const subs = await all(`SELECT s.enrollment_id, s.assignment_id, COUNT(*) AS n FROM submissions s
     JOIN submission_versions v ON v.submission_id = s.id AND v.revision = s.current_revision
     LEFT JOIN file_assets f ON f.id = v.file_id_optional
-    WHERE s.course_id = ? AND s.status = 'READY' AND (v.type = 'LINK' OR f.status = 'ATTACHED') AND s.enrollment_id IN (${ph})
-    GROUP BY s.enrollment_id, s.assignment_id`, courseId, ...enrollmentIds);
-  const unread = all(`SELECT f.enrollment_id, f.assignment_id, COUNT(*) n FROM feedback f
+    WHERE s.course_id = ? AND s.status = 'READY' AND (v.type = 'LINK' OR f.status = 'ATTACHED') AND s.enrollment_id = ANY(?::text[])
+    GROUP BY s.enrollment_id, s.assignment_id`, courseId, enrollmentIds);
+  const unread = await all(`SELECT f.enrollment_id, f.assignment_id, COUNT(*) AS n FROM feedback f
     JOIN enrollments e ON e.id = f.enrollment_id
     LEFT JOIN feedback_reads r ON r.feedback_id = f.id AND r.student_id = e.student_id
-    WHERE f.course_id = ? AND f.deleted_at IS NULL AND (r.last_read_version IS NULL OR r.last_read_version < f.version) AND f.enrollment_id IN (${ph})
-    GROUP BY f.enrollment_id, f.assignment_id`, courseId, ...enrollmentIds);
+    WHERE f.course_id = ? AND f.deleted_at IS NULL AND (r.last_read_version IS NULL OR r.last_read_version < f.version) AND f.enrollment_id = ANY(?::text[])
+    GROUP BY f.enrollment_id, f.assignment_id`, courseId, enrollmentIds);
   const tpMap = new Map(tps.map((t) => [t.enrollment_id + '|' + t.assignment_id, t]));
   const subMap = new Map(subs.map((s) => [s.enrollment_id + '|' + s.assignment_id, s.n]));
   const unreadMap = new Map(unread.map((s) => [s.enrollment_id + '|' + s.assignment_id, s.n]));
@@ -132,30 +127,29 @@ function cellMatrix(courseId, enrollmentIds, assignments) {
 }
 
 // 강의별 집계 (정수 건수 합산, 0 나눗셈 방지)
-function courseStats(courseIds) {
+async function courseStats(courseIds) {
   const out = new Map();
   if (!courseIds.length) return out;
-  const ph = courseIds.map(() => '?').join(',');
-  const rows = (sql) => all(sql, ...courseIds);
-  const act = rows(`SELECT e.course_id, COUNT(*) n FROM enrollments e JOIN students s ON s.id = e.student_id
-    WHERE e.status = 'ACTIVE' AND s.status = 'ACTIVE' AND e.course_id IN (${ph}) GROUP BY e.course_id`);
-  const pub = rows(`SELECT a.course_id, COUNT(*) n FROM assignments a JOIN challenges c ON c.id = a.challenge_id
-    WHERE a.visibility = 'PUBLISHED' AND c.visibility = 'PUBLISHED' AND a.course_id IN (${ph}) GROUP BY a.course_id`);
-  const tpAgg = rows(`SELECT tp.course_id,
+  const rows = (sql) => all(sql, courseIds);
+  const act = await rows(`SELECT e.course_id, COUNT(*) AS n FROM enrollments e JOIN students s ON s.id = e.student_id
+    WHERE e.status = 'ACTIVE' AND s.status = 'ACTIVE' AND e.course_id = ANY(?::text[]) GROUP BY e.course_id`);
+  const pub = await rows(`SELECT a.course_id, COUNT(*) AS n FROM assignments a JOIN challenges c ON c.id = a.challenge_id
+    WHERE a.visibility = 'PUBLISHED' AND c.visibility = 'PUBLISHED' AND a.course_id = ANY(?::text[]) GROUP BY a.course_id`);
+  const tpAgg = await rows(`SELECT tp.course_id,
       SUM(tp.is_completed) AS completed,
       SUM(CASE WHEN tp.is_completed = 1 AND tp.completion_timing = 'LATE' THEN 1 ELSE 0 END) AS late,
       SUM(CASE WHEN tp.started_at IS NOT NULL THEN 1 ELSE 0 END) AS started,
       SUM(CASE WHEN tp.is_completed = 0 AND a.submission_required = 1
-        AND (SELECT COUNT(*) FROM checklist_items i WHERE i.assignment_id = a.id) > 0
-        AND (SELECT COUNT(*) FROM item_progress ip WHERE ip.task_progress_id = tp.id AND ip.is_checked = 1)
-          = (SELECT COUNT(*) FROM checklist_items i WHERE i.assignment_id = a.id) THEN 1 ELSE 0 END) AS need_sub
+        AND ic.n > 0 AND (SELECT COUNT(*) FROM item_progress ip WHERE ip.task_progress_id = tp.id AND ip.is_checked = 1) = ic.n
+        THEN 1 ELSE 0 END) AS need_sub
     FROM task_progress tp
     JOIN enrollments e ON e.id = tp.enrollment_id AND e.status = 'ACTIVE'
     JOIN students s ON s.id = e.student_id AND s.status = 'ACTIVE'
     JOIN assignments a ON a.id = tp.assignment_id AND a.visibility = 'PUBLISHED'
     JOIN challenges c ON c.id = a.challenge_id AND c.visibility = 'PUBLISHED'
-    WHERE tp.course_id IN (${ph}) GROUP BY tp.course_id`);
-  const chs = rows(`SELECT course_id, COUNT(*) n FROM challenges WHERE course_id IN (${ph}) GROUP BY course_id`);
+    JOIN LATERAL (SELECT COUNT(*) AS n FROM checklist_items i WHERE i.assignment_id = a.id) ic ON true
+    WHERE tp.course_id = ANY(?::text[]) GROUP BY tp.course_id`);
+  const chs = await rows(`SELECT course_id, COUNT(*) AS n FROM challenges WHERE course_id = ANY(?::text[]) GROUP BY course_id`);
   const m = (arr) => new Map(arr.map((r) => [r.course_id, r]));
   const actM = m(act), pubM = m(pub), tpM = m(tpAgg), chM = m(chs);
   for (const id of courseIds) {

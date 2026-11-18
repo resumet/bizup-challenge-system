@@ -1,6 +1,5 @@
 'use strict';
 const express = require('express');
-const fs = require('fs');
 const crypto = require('crypto');
 const XLSX = require('xlsx');
 const iconv = require('iconv-lite');
@@ -11,20 +10,21 @@ const A = require('../auth');
 const P = require('../progress');
 const F = require('../files');
 const AC = require('../access');
+const { storage } = require('../storage');
 
 const r = express.Router();
 const STATES = ['READY', 'ACTIVE', 'ENDED', 'ARCHIVED'];
 
-function instructorsOf(courseId) {
+async function instructorsOf(courseId) {
   return all(`SELECT i.id, i.code, i.name, a.email, a.status AS account_status FROM course_instructors ci
     JOIN instructors i ON i.id = ci.instructor_id JOIN staff_accounts a ON a.id = i.staff_id
     WHERE ci.course_id = ? AND ci.status = 'ACTIVE' ORDER BY ci.assigned_at`, courseId);
 }
-function courseView(c, user, stats) {
+async function courseView(c, user, stats) {
   const v = {
     id: c.id, code: c.code, title: c.title, cohort_label: c.cohort_label, description: c.description, state: c.state,
     starts_on: c.starts_on, ends_on: c.ends_on, version: c.version, created_at: c.created_at, updated_at: c.updated_at,
-    instructors: instructorsOf(c.id),
+    instructors: await instructorsOf(c.id),
   };
   if (user.isAdmin) v.admin_memo = c.admin_memo;
   if (stats) v.stats = stats;
@@ -33,7 +33,7 @@ function courseView(c, user, stats) {
 }
 
 // ---------- 강의 ----------
-r.get('/courses', A.requireStaff, (req, res) => {
+r.get('/courses', A.requireStaff, async (req, res) => {
   const q = String(req.query.q || '').trim();
   const state = STATES.includes(req.query.state) ? req.query.state : null;
   const conds = []; const params = [];
@@ -42,101 +42,101 @@ r.get('/courses', A.requireStaff, (req, res) => {
     conds.push(`EXISTS (SELECT 1 FROM course_instructors ci WHERE ci.course_id = c.id AND ci.instructor_id = ? AND ci.status = 'ACTIVE')`);
     params.push(req.user.instructorId);
   }
-  if (q) { conds.push('(c.title LIKE ? OR c.cohort_label LIKE ? OR c.code LIKE ?)'); params.push(`%${q}%`, `%${q}%`, `%${q.toUpperCase()}%`); }
+  if (q) { conds.push('(c.title ILIKE ? OR c.cohort_label ILIKE ? OR c.code ILIKE ?)'); params.push(`%${q}%`, `%${q}%`, `%${q}%`); }
   if (state) { conds.push('c.state = ?'); params.push(state); } else if (req.query.include_archived !== '1') conds.push(`c.state != 'ARCHIVED'`);
   if (req.query.instructor_id) {
     conds.push(`EXISTS (SELECT 1 FROM course_instructors ci WHERE ci.course_id = c.id AND ci.instructor_id = ? AND ci.status = 'ACTIVE')`);
     params.push(String(req.query.instructor_id));
   }
   if (req.query.instructor_q) {
-    conds.push(`EXISTS (SELECT 1 FROM course_instructors ci JOIN instructors i ON i.id = ci.instructor_id WHERE ci.course_id = c.id AND ci.status = 'ACTIVE' AND i.name LIKE ?)`);
+    conds.push(`EXISTS (SELECT 1 FROM course_instructors ci JOIN instructors i ON i.id = ci.instructor_id WHERE ci.course_id = c.id AND ci.status = 'ACTIVE' AND i.name ILIKE ?)`);
     params.push(`%${req.query.instructor_q}%`);
   }
-  const rows = all(`SELECT * FROM courses c ${conds.length ? 'WHERE ' + conds.join(' AND ') : ''} ORDER BY c.created_at DESC LIMIT 500`, ...params);
-  const stats = P.courseStats(rows.map((x) => x.id));
-  res.json({ items: rows.map((c) => courseView(c, req.user, stats.get(c.id))) });
+  const rows = await all(`SELECT * FROM courses c ${conds.length ? 'WHERE ' + conds.join(' AND ') : ''} ORDER BY c.created_at DESC LIMIT 500`, ...params);
+  const stats = await P.courseStats(rows.map((x) => x.id));
+  res.json({ items: await Promise.all(rows.map((c) => courseView(c, req.user, stats.get(c.id)))) });
 });
 
 function courseInput(body, existing) {
   const o = {};
   o.title = body.title !== undefined ? U.requireStr(body.title, '강의명', 200) : existing.title;
   o.cohort_label = body.cohort_label !== undefined ? U.requireStr(body.cohort_label, '기수명', 100) : existing.cohort_label;
-  o.description = body.description !== undefined ? U.str(body.description, 5000) : existing?.description;
-  o.admin_memo = body.admin_memo !== undefined ? U.str(body.admin_memo, 5000) : existing?.admin_memo;
+  o.description = body.description !== undefined ? U.str(body.description, 5000) : existing.description ?? null;
+  o.admin_memo = body.admin_memo !== undefined ? U.str(body.admin_memo, 5000) : existing.admin_memo ?? null;
   o.state = body.state !== undefined ? body.state : (existing.state || 'READY');
   if (!STATES.includes(o.state)) throw E.invalid('운영 상태 값이 올바르지 않습니다.');
   for (const k of ['starts_on', 'ends_on']) {
-    o[k] = body[k] !== undefined ? (body[k] || null) : existing?.[k] ?? null;
+    o[k] = body[k] !== undefined ? (body[k] || null) : existing[k] ?? null;
     if (o[k] && !U.isValidDate(o[k])) throw E.invalid('날짜 형식이 올바르지 않습니다.');
   }
   if (o.starts_on && o.ends_on && o.starts_on > o.ends_on) throw E.invalid('시작일이 종료일보다 늦을 수 없습니다.');
   return o;
 }
 
-r.post('/courses', A.requireAdmin, (req, res) => {
+r.post('/courses', A.requireAdmin, async (req, res) => {
   const o = courseInput(req.body, {});
-  const ins = Array.isArray(req.body.instructor_ids) ? [...new Set(req.body.instructor_ids)] : [];
-  const out = tx(() => {
-    if (!req.body.confirm_duplicate && get('SELECT 1 FROM courses WHERE title = ? AND cohort_label = ?', o.title, o.cohort_label)) {
+  const ins = Array.isArray(req.body.instructor_ids) ? [...new Set(req.body.instructor_ids.map(String))] : [];
+  const out = await tx(async () => {
+    if (!req.body.confirm_duplicate && await get('SELECT 1 AS ok FROM courses WHERE title = ? AND cohort_label = ?', o.title, o.cohort_label)) {
       throw E.conflict('같은 강의명·기수의 강의가 이미 있습니다. 그래도 생성하려면 확인해주세요.', { reason: 'POSSIBLE_DUPLICATE' });
     }
-    for (const iid of ins) if (!get('SELECT 1 FROM instructors WHERE id = ?', iid)) throw E.invalid('존재하지 않는 강사가 포함되어 있습니다.');
+    for (const iid of ins) if (!(await get('SELECT 1 AS ok FROM instructors WHERE id = ?', iid))) throw E.invalid('존재하지 않는 강사가 포함되어 있습니다.');
     if (o.state === 'ACTIVE' && ins.length === 0) throw E.invalid('진행 중으로 전환하려면 강사를 1명 이상 배정해주세요.');
-    const id = uuid(); const code = nextCode('CRS'); const t = now();
-    run(`INSERT INTO courses(id, code, title, cohort_label, description, state, starts_on, ends_on, admin_memo, created_by, updated_by, created_at, updated_at)
+    const id = uuid(); const code = await nextCode('CRS'); const t = now();
+    await run(`INSERT INTO courses(id, code, title, cohort_label, description, state, starts_on, ends_on, admin_memo, created_by, updated_by, created_at, updated_at)
       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`, id, code, o.title, o.cohort_label, o.description, o.state, o.starts_on, o.ends_on, o.admin_memo, req.user.id, req.user.id, t, t);
-    ins.forEach((iid) => run(`INSERT INTO course_instructors(course_id, instructor_id, status, assigned_at) VALUES(?,?,'ACTIVE',?)`, id, iid, t));
-    A.audit(req, { courseId: id, targetType: 'COURSE', targetId: id, action: 'COURSE_CREATED', changed: { title: o.title, cohort_label: o.cohort_label } });
-    return courseView(get('SELECT * FROM courses WHERE id = ?', id), req.user);
+    for (const iid of ins) await run(`INSERT INTO course_instructors(course_id, instructor_id, status, assigned_at) VALUES(?,?,'ACTIVE',?)`, id, iid, t);
+    await A.audit(req, { courseId: id, targetType: 'COURSE', targetId: id, action: 'COURSE_CREATED', changed: { title: o.title, cohort_label: o.cohort_label } });
+    return courseView(await get('SELECT * FROM courses WHERE id = ?', id), req.user);
   });
   res.status(201).json(out);
 });
 
-r.get('/courses/:id', A.requireStaff, (req, res) => {
-  const c = AC.loadCourseForStaff(req.user, req.params.id);
-  res.json(courseView(c, req.user, P.courseStats([c.id]).get(c.id)));
+r.get('/courses/:id', A.requireStaff, async (req, res) => {
+  const c = await AC.loadCourseForStaff(req.user, req.params.id);
+  res.json(await courseView(c, req.user, (await P.courseStats([c.id])).get(c.id)));
 });
 
-r.patch('/courses/:id', A.requireAdmin, (req, res) => {
-  const out = tx(() => {
-    const c = get('SELECT * FROM courses WHERE id = ?', req.params.id);
+r.patch('/courses/:id', A.requireAdmin, async (req, res) => {
+  const out = await tx(async () => {
+    const c = await get('SELECT * FROM courses WHERE id = ? FOR UPDATE', req.params.id);
     if (!c) throw E.notFound();
     if (req.body.version !== undefined && Number(req.body.version) !== c.version) {
-      throw E.conflict('다른 변경 내용이 있습니다. 최신 내용을 확인한 뒤 다시 저장해주세요.', { reason: 'VERSION_CONFLICT', latest: courseView(c, req.user) });
+      throw E.conflict('다른 변경 내용이 있습니다. 최신 내용을 확인한 뒤 다시 저장해주세요.', { reason: 'VERSION_CONFLICT', latest: await courseView(c, req.user) });
     }
     const o = courseInput(req.body, c);
-    if (o.state === 'ACTIVE' && c.state !== 'ACTIVE' && instructorsOf(c.id).length === 0) throw E.invalid('진행 중으로 전환하려면 강사를 1명 이상 배정해주세요.');
+    if (o.state === 'ACTIVE' && c.state !== 'ACTIVE' && (await instructorsOf(c.id)).length === 0) throw E.invalid('진행 중으로 전환하려면 강사를 1명 이상 배정해주세요.');
     const changed = {};
     for (const k of Object.keys(o)) if ((o[k] ?? null) !== (c[k] ?? null)) changed[k] = [c[k], o[k]];
-    run(`UPDATE courses SET title=?, cohort_label=?, description=?, state=?, starts_on=?, ends_on=?, admin_memo=?, version=version+1, updated_by=?, updated_at=? WHERE id=?`,
+    await run(`UPDATE courses SET title=?, cohort_label=?, description=?, state=?, starts_on=?, ends_on=?, admin_memo=?, version=version+1, updated_by=?, updated_at=? WHERE id=?`,
       o.title, o.cohort_label, o.description, o.state, o.starts_on, o.ends_on, o.admin_memo, req.user.id, now(), c.id);
-    if (Object.keys(changed).length) A.audit(req, { courseId: c.id, targetType: 'COURSE', targetId: c.id, action: 'COURSE_UPDATED', changed });
-    return courseView(get('SELECT * FROM courses WHERE id = ?', c.id), req.user);
+    if (Object.keys(changed).length) await A.audit(req, { courseId: c.id, targetType: 'COURSE', targetId: c.id, action: 'COURSE_UPDATED', changed });
+    return courseView(await get('SELECT * FROM courses WHERE id = ?', c.id), req.user);
   });
   res.json(out);
 });
 
-r.put('/courses/:id/instructors/:iid', A.requireAdmin, (req, res) => {
-  tx(() => {
-    const c = get('SELECT * FROM courses WHERE id = ?', req.params.id);
-    const i = get('SELECT * FROM instructors WHERE id = ?', req.params.iid);
+r.put('/courses/:id/instructors/:iid', A.requireAdmin, async (req, res) => {
+  await tx(async () => {
+    const c = await get('SELECT * FROM courses WHERE id = ?', req.params.id);
+    const i = await get('SELECT * FROM instructors WHERE id = ?', req.params.iid);
     if (!c || !i) throw E.notFound();
-    const ex = get('SELECT * FROM course_instructors WHERE course_id = ? AND instructor_id = ?', c.id, i.id);
+    const ex = await get('SELECT * FROM course_instructors WHERE course_id = ? AND instructor_id = ? FOR UPDATE', c.id, i.id);
     if (ex && ex.status === 'ACTIVE') return;
-    if (ex) run(`UPDATE course_instructors SET status = 'ACTIVE', assigned_at = ?, removed_at = NULL WHERE course_id = ? AND instructor_id = ?`, now(), c.id, i.id);
-    else run(`INSERT INTO course_instructors(course_id, instructor_id, status, assigned_at) VALUES(?,?,'ACTIVE',?)`, c.id, i.id, now());
-    A.audit(req, { courseId: c.id, targetType: 'COURSE', targetId: c.id, action: 'INSTRUCTOR_ASSIGNED', changed: { instructor: i.code } });
+    await run(`INSERT INTO course_instructors(course_id, instructor_id, status, assigned_at) VALUES(?,?,'ACTIVE',?)
+      ON CONFLICT (course_id, instructor_id) DO UPDATE SET status = 'ACTIVE', assigned_at = excluded.assigned_at, removed_at = NULL`, c.id, i.id, now());
+    await A.audit(req, { courseId: c.id, targetType: 'COURSE', targetId: c.id, action: 'INSTRUCTOR_ASSIGNED', changed: { instructor: i.code } });
   });
-  res.json({ instructors: instructorsOf(req.params.id) });
+  res.json({ instructors: await instructorsOf(req.params.id) });
 });
-r.delete('/courses/:id/instructors/:iid', A.requireAdmin, (req, res) => {
-  const out = tx(() => {
-    const c = get('SELECT * FROM courses WHERE id = ?', req.params.id);
-    const i = get('SELECT * FROM instructors WHERE id = ?', req.params.iid);
+r.delete('/courses/:id/instructors/:iid', A.requireAdmin, async (req, res) => {
+  const out = await tx(async () => {
+    const c = await get('SELECT * FROM courses WHERE id = ?', req.params.id);
+    const i = await get('SELECT * FROM instructors WHERE id = ?', req.params.iid);
     if (!c || !i) throw E.notFound();
-    run(`UPDATE course_instructors SET status = 'REMOVED', removed_at = ? WHERE course_id = ? AND instructor_id = ? AND status = 'ACTIVE'`, now(), c.id, i.id);
-    A.audit(req, { courseId: c.id, targetType: 'COURSE', targetId: c.id, action: 'INSTRUCTOR_REMOVED', changed: { instructor: i.code } });
-    const list = instructorsOf(c.id);
+    await run(`UPDATE course_instructors SET status = 'REMOVED', removed_at = ? WHERE course_id = ? AND instructor_id = ? AND status = 'ACTIVE'`, now(), c.id, i.id);
+    await A.audit(req, { courseId: c.id, targetType: 'COURSE', targetId: c.id, action: 'INSTRUCTOR_REMOVED', changed: { instructor: i.code } });
+    const list = await instructorsOf(c.id);
     return { instructors: list, no_instructor_warning: c.state === 'ACTIVE' && list.length === 0 };
   });
   res.json(out);
@@ -144,15 +144,14 @@ r.delete('/courses/:id/instructors/:iid', A.requireAdmin, (req, res) => {
 
 // ---------- 수강생 명단 ----------
 function enrollmentRow(e, user) {
-  const phoneVisible = user.isAdmin;
   return {
     id: e.id, status: e.status, enrolled_at: e.enrolled_at, deactivated_at: e.deactivated_at,
     reason: user.isAdmin ? e.reason : undefined, admin_memo: user.isAdmin ? e.admin_memo : undefined,
-    student: { id: e.student_id, code: e.code, name: e.name, status: e.student_status, phone: phoneVisible ? U.formatPhone(e.normalized_phone) : U.maskPhone(e.normalized_phone) },
+    student: { id: e.student_id, code: e.code, name: e.name, status: e.student_status, phone: user.isAdmin ? U.formatPhone(e.normalized_phone) : U.maskPhone(e.normalized_phone) },
   };
 }
-r.get('/courses/:id/enrollments', A.requireStaff, (req, res) => {
-  const c = AC.loadCourseForStaff(req.user, req.params.id);
+r.get('/courses/:id/enrollments', A.requireStaff, async (req, res) => {
+  const c = await AC.loadCourseForStaff(req.user, req.params.id);
   const { page, size, offset } = U.pageParams(req.query);
   const status = ['ACTIVE', 'INACTIVE', 'ALL'].includes(req.query.status) ? req.query.status : 'ACTIVE';
   const q = U.normalizeName(req.query.q || '');
@@ -160,15 +159,15 @@ r.get('/courses/:id/enrollments', A.requireStaff, (req, res) => {
   const conds = ['e.course_id = ?']; const params = [c.id];
   if (status !== 'ALL') { conds.push('e.status = ?'); params.push(status); }
   if (q) {
-    conds.push(`(s.normalized_name LIKE ? OR s.code LIKE ? ${digits.length >= 4 ? 'OR s.normalized_phone LIKE ?' : ''})`);
-    params.push(`%${q}%`, `%${q.toUpperCase()}%`); if (digits.length >= 4) params.push(`%${digits}%`);
+    conds.push(`(s.normalized_name ILIKE ? OR s.code ILIKE ? ${digits.length >= 4 ? 'OR s.normalized_phone LIKE ?' : ''})`);
+    params.push(`%${q}%`, `%${q}%`); if (digits.length >= 4) params.push(`%${digits}%`);
   }
   const where = conds.join(' AND ');
-  const total = get(`SELECT COUNT(*) n FROM enrollments e JOIN students s ON s.id = e.student_id WHERE ${where}`, ...params).n;
-  const rows = all(`SELECT e.*, s.code, s.name, s.normalized_phone, s.status AS student_status FROM enrollments e JOIN students s ON s.id = e.student_id
+  const total = (await get(`SELECT COUNT(*) AS n FROM enrollments e JOIN students s ON s.id = e.student_id WHERE ${where}`, ...params)).n;
+  const rows = await all(`SELECT e.*, s.code, s.name, s.normalized_phone, s.status AS student_status FROM enrollments e JOIN students s ON s.id = e.student_id
     WHERE ${where} ORDER BY s.normalized_name, s.code LIMIT ? OFFSET ?`, ...params, size, offset);
-  const pubs = P.publishedAssignments(c.id);
-  const cells = P.cellMatrix(c.id, rows.map((x) => x.id), pubs);
+  const pubs = await P.publishedAssignments(c.id);
+  const cells = await P.cellMatrix(c.id, rows.map((x) => x.id), pubs);
   res.json({
     items: rows.map((e) => {
       const v = enrollmentRow(e, req.user);
@@ -181,93 +180,93 @@ r.get('/courses/:id/enrollments', A.requireStaff, (req, res) => {
   });
 });
 
+async function createStudent(name, phone, hash) {
+  const id = uuid(); const t = now();
+  await run(`INSERT INTO students(id, code, name, normalized_name, normalized_phone, status, created_at, updated_at) VALUES(?,?,?,?,?,'ACTIVE',?,?)`,
+    id, await nextCode('STU'), name, name, phone, t, t);
+  await run('INSERT INTO student_credentials(student_id, password_hash) VALUES(?,?)', id, hash);
+  return get('SELECT * FROM students WHERE id = ?', id);
+}
+async function createEnrollment(req, courseId, studentId, memo, source) {
+  const id = uuid();
+  await run(`INSERT INTO enrollments(id, course_id, student_id, status, enrolled_at, admin_memo) VALUES(?,?,?,'ACTIVE',?,?)`, id, courseId, studentId, now(), memo);
+  await run(`INSERT INTO enrollment_events(enrollment_id, action, actor_id, reason, created_at) VALUES(?,?,?,?,?)`, id, 'ENROLLED', req.user.id, source, now());
+  await A.audit(req, { courseId, targetType: 'ENROLLMENT', targetId: id, action: 'ENROLLED', changed: { source } });
+  return id;
+}
+
 // 7.4 개별 등록·기존 학생 연결 (관리자)
 r.post('/courses/:id/enrollments', A.requireAdmin, async (req, res) => {
-  const c = get('SELECT * FROM courses WHERE id = ?', req.params.id);
+  const c = await get('SELECT * FROM courses WHERE id = ?', req.params.id);
   if (!c) throw E.notFound();
   const memo = U.str(req.body.memo, 1000);
-  let studentId = req.body.student_id || null;
+  const studentId = req.body.student_id || null;
   let name; let phone; let hash = null;
   if (!studentId) {
     name = U.normalizeName(U.str(req.body.name, 50));
     if (!name) throw E.invalid('이름을 입력해주세요.');
     phone = U.normalizePhone(req.body.phone);
     if (!phone) throw E.invalid(U.phoneError(req.body.phone));
-    if (!get('SELECT 1 FROM students WHERE normalized_phone = ?', phone)) hash = await A.hashPassword(phone, 'STUDENT');
+    if (!(await get('SELECT 1 AS ok FROM students WHERE normalized_phone = ?', phone))) hash = await A.hashPassword(phone, 'STUDENT');
   }
-  const out = tx(() => {
+  const out = await tx(async () => {
     let s;
     if (studentId) {
-      s = get('SELECT * FROM students WHERE id = ?', studentId);
+      s = await get('SELECT * FROM students WHERE id = ?', studentId);
       if (!s) throw E.notFound();
     } else {
-      s = get('SELECT * FROM students WHERE normalized_phone = ?', phone);
+      s = await get('SELECT * FROM students WHERE normalized_phone = ?', phone);
       if (s && s.normalized_name !== name) throw E.conflict('기존 수강생 정보와 이름이 다릅니다. 확인 후 등록해주세요.', { reason: 'NAME_CONFLICT', existing: { code: s.code, name: s.name } });
     }
     if (s && s.status !== 'ACTIVE') throw E.conflict('비활성화된 수강생입니다. 전체 학생 관리에서 검토 후 활성화해주세요.', { reason: 'STUDENT_INACTIVE' });
     if (s) {
-      const ex = get('SELECT * FROM enrollments WHERE course_id = ? AND student_id = ?', c.id, s.id);
+      const ex = await get('SELECT * FROM enrollments WHERE course_id = ? AND student_id = ?', c.id, s.id);
       if (ex && ex.status === 'ACTIVE') throw E.conflict('이미 등록된 수강생입니다. 기존 기록을 유지합니다.', { reason: 'ALREADY_ENROLLED' });
       if (ex) throw E.conflict('비활성화된 수강 등록이 있습니다. 재활성화가 필요합니다.', { reason: 'NEEDS_REACTIVATION', enrollment_id: ex.id });
     } else {
       if (!hash) throw E.conflict('잠시 후 다시 시도해주세요.');
-      s = createStudent(name, phone, hash);
-      A.audit(req, { courseId: c.id, targetType: 'STUDENT', targetId: s.id, action: 'STUDENT_CREATED', changed: { code: s.code } });
+      s = await createStudent(name, phone, hash);
+      await A.audit(req, { courseId: c.id, targetType: 'STUDENT', targetId: s.id, action: 'STUDENT_CREATED', changed: { code: s.code } });
     }
-    const eid = createEnrollment(req, c.id, s.id, memo, 'MANUAL');
+    const eid = await createEnrollment(req, c.id, s.id, memo, 'MANUAL');
     return { enrollment_id: eid, student: { id: s.id, code: s.code, name: s.name } };
   });
   res.status(201).json(out);
 });
 
-function createStudent(name, phone, hash) {
-  const id = uuid(); const t = now();
-  run(`INSERT INTO students(id, code, name, normalized_name, normalized_phone, status, created_at, updated_at) VALUES(?,?,?,?,?,'ACTIVE',?,?)`,
-    id, nextCode('STU'), name, name, phone, t, t);
-  run('INSERT INTO student_credentials(student_id, password_hash) VALUES(?,?)', id, hash);
-  return get('SELECT * FROM students WHERE id = ?', id);
-}
-function createEnrollment(req, courseId, studentId, memo, source) {
-  const id = uuid();
-  run(`INSERT INTO enrollments(id, course_id, student_id, status, enrolled_at, admin_memo) VALUES(?,?,?,'ACTIVE',?,?)`, id, courseId, studentId, now(), memo);
-  run(`INSERT INTO enrollment_events(enrollment_id, action, actor_id, reason, created_at) VALUES(?,?,?,?,?)`, id, 'ENROLLED', req.user.id, source, now());
-  A.audit(req, { courseId, targetType: 'ENROLLMENT', targetId: id, action: 'ENROLLED', changed: { source } });
-  return id;
-}
-
 // 7.5 수강 등록 비활성화·재활성화
-r.patch('/enrollments/:id/status', A.requireAdmin, (req, res) => {
+r.patch('/enrollments/:id/status', A.requireAdmin, async (req, res) => {
   const status = req.body.status;
   if (!['ACTIVE', 'INACTIVE'].includes(status)) throw E.invalid('상태 값이 올바르지 않습니다.');
   const reason = (U.str(req.body.reason, 500) || '').trim();
   if (status === 'INACTIVE' && !reason) throw E.invalid('비활성화 사유를 입력해주세요. (환불, 중도탈퇴, 오등록 등)');
-  const out = tx(() => {
-    const e = get('SELECT * FROM enrollments WHERE id = ?', req.params.id);
+  const out = await tx(async () => {
+    const e = await get('SELECT * FROM enrollments WHERE id = ? FOR UPDATE', req.params.id);
     if (!e) throw E.notFound();
     if (e.status === status) return { id: e.id, status };
-    if (status === 'INACTIVE') run(`UPDATE enrollments SET status = 'INACTIVE', deactivated_at = ?, reason = ? WHERE id = ?`, now(), reason, e.id);
-    else run(`UPDATE enrollments SET status = 'ACTIVE', deactivated_at = NULL, reason = ? WHERE id = ?`, reason || null, e.id);
-    run(`INSERT INTO enrollment_events(enrollment_id, action, actor_id, reason, created_at) VALUES(?,?,?,?,?)`, e.id, status === 'ACTIVE' ? 'REACTIVATED' : 'DEACTIVATED', req.user.id, reason, now());
-    A.audit(req, { courseId: e.course_id, targetType: 'ENROLLMENT', targetId: e.id, action: status === 'ACTIVE' ? 'ENROLLMENT_REACTIVATED' : 'ENROLLMENT_DEACTIVATED', reason });
+    if (status === 'INACTIVE') await run(`UPDATE enrollments SET status = 'INACTIVE', deactivated_at = ?, reason = ? WHERE id = ?`, now(), reason, e.id);
+    else await run(`UPDATE enrollments SET status = 'ACTIVE', deactivated_at = NULL, reason = ? WHERE id = ?`, reason || null, e.id);
+    await run(`INSERT INTO enrollment_events(enrollment_id, action, actor_id, reason, created_at) VALUES(?,?,?,?,?)`, e.id, status === 'ACTIVE' ? 'REACTIVATED' : 'DEACTIVATED', req.user.id, reason, now());
+    await A.audit(req, { courseId: e.course_id, targetType: 'ENROLLMENT', targetId: e.id, action: status === 'ACTIVE' ? 'ENROLLMENT_REACTIVATED' : 'ENROLLMENT_DEACTIVATED', reason });
     return { id: e.id, status };
   });
   res.json(out);
 });
-r.patch('/enrollments/:id', A.requireAdmin, (req, res) => {
-  const e = get('SELECT * FROM enrollments WHERE id = ?', req.params.id);
+r.patch('/enrollments/:id', A.requireAdmin, async (req, res) => {
+  const e = await get('SELECT * FROM enrollments WHERE id = ?', req.params.id);
   if (!e) throw E.notFound();
-  run('UPDATE enrollments SET admin_memo = ? WHERE id = ?', U.str(req.body.admin_memo, 1000), e.id);
+  await run('UPDATE enrollments SET admin_memo = ? WHERE id = ?', U.str(req.body.admin_memo, 1000), e.id);
   res.json({ ok: true });
 });
 
 // 5.3 학생 로그인 정보 확인 (조회 이력 기록)
-r.post('/enrollments/:id/login-info/reveal', A.requireStaff, (req, res) => {
-  const e = AC.loadEnrollmentForStaff(req.user, req.params.id);
-  const s = get('SELECT * FROM students WHERE id = ?', e.student_id);
+r.post('/enrollments/:id/login-info/reveal', A.requireStaff, async (req, res) => {
+  const e = await AC.loadEnrollmentForStaff(req.user, req.params.id);
+  const s = await get('SELECT * FROM students WHERE id = ?', e.student_id);
   if (!req.user.isAdmin && (e.status !== 'ACTIVE' || s.status !== 'ACTIVE')) {
     throw E.forbidden('비활성 수강생의 로그인 정보는 확인할 수 없습니다.');
   }
-  A.audit(req, { courseId: e.course_id, targetType: 'STUDENT', targetId: s.id, action: 'LOGIN_INFO_REVEALED', changed: { enrollment_id: e.id }, restricted: true });
+  await A.audit(req, { courseId: e.course_id, targetType: 'STUDENT', targetId: s.id, action: 'LOGIN_INFO_REVEALED', changed: { enrollment_id: e.id }, restricted: true });
   res.json({ code: s.code, login_id: s.name, login_password: s.normalized_phone, phone_display: U.formatPhone(s.normalized_phone) });
 });
 
@@ -279,7 +278,7 @@ r.get('/import-template.csv', A.requireAdmin, (req, res) => {
 });
 
 function decodeCsv(buf) {
-  if (buf[0] === 0xef && buf[1] === 0xbb && buf[2] === 0xbf) return buf.slice(3).toString('utf8');
+  if (buf[0] === 0xef && buf[1] === 0xbb && buf[2] === 0xbf) return buf.subarray(3).toString('utf8');
   const u = buf.toString('utf8');
   if (!u.includes('�')) return u;
   const k = iconv.decode(buf, 'cp949');
@@ -287,8 +286,13 @@ function decodeCsv(buf) {
   return k;
 }
 function readWorkbook(buf, name) {
-  if (name.toLowerCase().endsWith('.csv')) return XLSX.read(decodeCsv(buf), { type: 'string', raw: true });
-  return XLSX.read(buf, { type: 'buffer', cellDates: false });
+  try {
+    if (name.toLowerCase().endsWith('.csv')) return XLSX.read(decodeCsv(buf), { type: 'string', raw: true });
+    return XLSX.read(buf, { type: 'buffer', cellDates: false });
+  } catch (e) {
+    if (e.status) throw e;
+    throw E.invalid('파일을 읽을 수 없습니다. 표준 양식(.xlsx 또는 CSV)을 사용해주세요.');
+  }
 }
 function sheetRows(wb, sheet) {
   const ws = wb.Sheets[sheet];
@@ -301,8 +305,9 @@ function guessMapping(headers) {
   return { name: find(/^(이름|성명|수강생명|name)$/i) ?? find(/이름|성명/), phone: find(/전화|휴대폰|핸드폰|연락처|phone|mobile/i), memo: find(/메모|memo|비고/i) };
 }
 
-function classifyJob(job) {
-  const rows = all('SELECT * FROM import_rows WHERE import_job_id = ? ORDER BY row_number', job.id);
+// 행 분류: 학생·등록 조회를 한 번에 수행하고 결과를 일괄 갱신한다 (대량 명단에서도 왕복 횟수 일정).
+async function classifyJob(job) {
+  const rows = await all('SELECT * FROM import_rows WHERE import_job_id = ? ORDER BY row_number', job.id);
   const prepared = rows.map((row) => {
     const name = U.normalizeName(row.raw_name);
     const phone = U.normalizePhone(row.raw_phone);
@@ -311,7 +316,7 @@ function classifyJob(job) {
     else if (!name && !String(row.raw_phone || '').trim()) { cls = 'ERROR'; error = '이름과 전화번호가 비어 있습니다.'; }
     else if (!name) { cls = 'ERROR'; error = '이름이 비어 있습니다.'; }
     else if (!phone) { cls = 'ERROR'; error = U.phoneError(row.raw_phone); }
-    return { row, name, phone, cls, error };
+    return { row, name, phone, cls, error, student_id: null, enrollment_id: null };
   });
   const groups = new Map();
   prepared.filter((p) => !p.cls).forEach((p) => { if (!groups.has(p.phone)) groups.set(p.phone, []); groups.get(p.phone).push(p); });
@@ -320,191 +325,214 @@ function classifyJob(job) {
     if (names.size > 1) list.forEach((p) => { p.cls = 'CONFLICT_IN_FILE'; p.error = '같은 파일 안에 같은 전화번호로 서로 다른 이름이 있습니다.'; });
     else list.slice(1).forEach((p) => { p.cls = 'DUP_IN_FILE'; p.error = `파일 안 중복 행입니다. (${list[0].row.row_number}행만 처리)`; });
   }
+  const phones = prepared.filter((p) => !p.cls).map((p) => p.phone);
+  const students = phones.length ? await all('SELECT * FROM students WHERE normalized_phone = ANY(?::text[])', phones) : [];
+  const sByPhone = new Map(students.map((s) => [s.normalized_phone, s]));
+  const enrs = students.length ? await all('SELECT * FROM enrollments WHERE course_id = ? AND student_id = ANY(?::text[])', job.course_id, students.map((s) => s.id)) : [];
+  const eByStudent = new Map(enrs.map((e) => [e.student_id, e]));
   for (const p of prepared) {
     if (p.cls) continue;
-    const s = get('SELECT * FROM students WHERE normalized_phone = ?', p.phone);
+    const s = sByPhone.get(p.phone);
     if (!s) { p.cls = 'NEW'; continue; }
     if (s.normalized_name !== p.name) { p.cls = 'NAME_CONFLICT'; p.error = `기존 수강생 정보와 이름이 다릅니다. 확인 후 등록해주세요. (기존: ${s.name}, ${s.code})`; continue; }
     if (s.status !== 'ACTIVE') { p.cls = 'STUDENT_INACTIVE'; p.error = '비활성화된 수강생입니다. 관리자 검토가 필요합니다.'; continue; }
-    const e = get('SELECT * FROM enrollments WHERE course_id = ? AND student_id = ?', job.course_id, s.id);
-    if (!e) { p.cls = 'EXISTING_NEW_ENROLLMENT'; p.student_id = s.id; continue; }
-    if (e.status === 'ACTIVE') { p.cls = 'ALREADY_ENROLLED'; p.error = '이미 등록된 수강생입니다. 기존 기록을 유지합니다.'; }
-    else { p.cls = 'NEEDS_REACTIVATION'; p.error = '비활성화된 수강 등록입니다. 재활성화가 필요합니다.'; }
-    p.student_id = s.id; p.enrollment_id = e.id;
+    const e = eByStudent.get(s.id);
+    p.student_id = s.id;
+    if (!e) { p.cls = 'EXISTING_NEW_ENROLLMENT'; continue; }
+    p.enrollment_id = e.id;
+    if (e.status === 'ACTIVE') { p.cls = 'ALREADY_ENROLLED'; p.error = '이미 등록된 수강생입니다. 기존 기록을 유지합니다.'; } else { p.cls = 'NEEDS_REACTIVATION'; p.error = '비활성화된 수강 등록입니다. 재활성화가 필요합니다.'; }
   }
-  for (const p of prepared) {
-    run(`UPDATE import_rows SET normalized_name = ?, normalized_phone = ?, classification = ?, error = ?, student_id_optional = ?, enrollment_id_optional = ?
-      WHERE import_job_id = ? AND row_number = ?`, p.name, p.phone, p.cls, p.error, p.student_id || null, p.enrollment_id || null, job.id, p.row.row_number);
-  }
+  if (!prepared.length) return;
+  const col = (f) => prepared.map(f);
+  await run(`UPDATE import_rows r SET normalized_name = u.nn, normalized_phone = u.np, classification = u.cls, error = u.err,
+      student_id_optional = u.sid, enrollment_id_optional = u.eid
+    FROM unnest(?::int[], ?::text[], ?::text[], ?::text[], ?::text[], ?::text[], ?::text[]) AS u(rn, nn, np, cls, err, sid, eid)
+    WHERE r.import_job_id = ? AND r.row_number = u.rn`,
+  col((p) => p.row.row_number), col((p) => p.name), col((p) => p.phone), col((p) => p.cls), col((p) => p.error),
+  col((p) => p.student_id), col((p) => p.enrollment_id), job.id);
 }
 const COMMITTABLE = ['NEW', 'EXISTING_NEW_ENROLLMENT'];
-function jobView(jobId) {
-  const j = get('SELECT j.*, c.code AS course_code, c.title AS course_title, c.cohort_label FROM import_jobs j JOIN courses c ON c.id = j.course_id WHERE j.id = ?', jobId);
-  const rows = all('SELECT * FROM import_rows WHERE import_job_id = ? ORDER BY row_number', jobId).map((x) => ({
+async function jobView(jobId) {
+  const j = await get('SELECT j.*, c.code AS course_code, c.title AS course_title, c.cohort_label FROM import_jobs j JOIN courses c ON c.id = j.course_id WHERE j.id = ?', jobId);
+  const rows = (await all('SELECT * FROM import_rows WHERE import_job_id = ? ORDER BY row_number', jobId)).map((x) => ({
     row_number: x.row_number, raw_name: x.raw_name, raw_phone: x.raw_phone, memo: x.memo, name: x.normalized_name,
     phone: x.normalized_phone ? U.formatPhone(x.normalized_phone) : null, classification: x.classification, error: x.error,
     excluded: !!x.excluded, result: x.result, result_message: x.result_message,
   }));
   const counts = {};
   rows.forEach((x) => { counts[x.classification] = (counts[x.classification] || 0) + 1; });
+  const processed = rows.filter((x) => x.result).length;
   return {
     id: j.id, course_id: j.course_id, course_code: j.course_code, course_title: j.course_title, cohort_label: j.cohort_label,
     state: j.state, original_name: j.original_name, sheet_names: JSON.parse(j.sheet_names || '[]'), sheet_name: j.sheet_name,
     headers: JSON.parse(j.headers || '[]'), mapping: JSON.parse(j.mapping || '{}'), created_at: j.created_at, committed_at: j.committed_at,
     preview_counts: counts, committable: rows.filter((x) => COMMITTABLE.includes(x.classification)).length,
+    progress: { processed, total: rows.length },
     result_counts: j.counts ? JSON.parse(j.counts) : null, rows,
   };
 }
-function loadRowsFromWorkbook(job, wb, sheet, mappingIn) {
+async function loadRowsFromWorkbook(job, wb, sheet, mappingIn) {
   const data = sheetRows(wb, sheet);
   const headers = (data[0] || []).map((h) => String(h).trim());
   const mapping = mappingIn && mappingIn.name != null && mappingIn.phone != null ? mappingIn : guessMapping(headers);
   const body = data.slice(1);
   if (body.length > F.LIMITS.rosterRows) throw E.invalid(`명단은 최대 ${F.LIMITS.rosterRows}행까지 업로드할 수 있습니다.`);
-  run('DELETE FROM import_rows WHERE import_job_id = ?', job.id);
-  run('UPDATE import_jobs SET sheet_name = ?, headers = ?, mapping = ? WHERE id = ?', sheet, JSON.stringify(headers), JSON.stringify(mapping), job.id);
+  await run('DELETE FROM import_rows WHERE import_job_id = ?', job.id);
+  await run('UPDATE import_jobs SET sheet_name = ?, headers = ?, mapping = ? WHERE id = ?', sheet, JSON.stringify(headers), JSON.stringify(mapping), job.id);
   if (mapping.name == null || mapping.phone == null) return; // 열 매핑 필요
   const cell = (row, i) => (i == null || i === '' ? '' : String(row[Number(i)] ?? '').trim());
-  body.forEach((row, idx) => {
-    run(`INSERT INTO import_rows(import_job_id, row_number, raw_name, raw_phone, memo, classification) VALUES(?,?,?,?,?,'PENDING')`,
-      job.id, idx + 2, cell(row, mapping.name).slice(0, 100), cell(row, mapping.phone).slice(0, 40), cell(row, mapping.memo).slice(0, 1000) || null);
-  });
-  classifyJob(job);
+  if (body.length) {
+    await run(`INSERT INTO import_rows(import_job_id, row_number, raw_name, raw_phone, memo, classification)
+      SELECT ?, u.rn, u.nm, u.ph, u.memo, 'PENDING' FROM unnest(?::int[], ?::text[], ?::text[], ?::text[]) AS u(rn, nm, ph, memo)`,
+    job.id, body.map((_, i) => i + 2), body.map((row) => cell(row, mapping.name).slice(0, 100)),
+    body.map((row) => cell(row, mapping.phone).slice(0, 40)), body.map((row) => cell(row, mapping.memo).slice(0, 1000) || null));
+  }
+  await classifyJob(job);
 }
-function loadJob(id) {
-  const j = get('SELECT * FROM import_jobs WHERE id = ?', id);
+async function loadJob(id, lock) {
+  const j = await get('SELECT * FROM import_jobs WHERE id = ?' + (lock ? ' FOR UPDATE' : ''), id);
   if (!j) throw E.notFound();
   return j;
 }
+async function readRosterFile(fileId) {
+  const f = await get('SELECT * FROM file_assets WHERE id = ?', fileId);
+  return { f, wb: readWorkbook(await storage().read(f.object_key), f.original_name) };
+}
 
-r.post('/courses/:id/imports/preview', A.requireAdmin, F.uploadRoster, (req, res) => {
-  const c = get('SELECT * FROM courses WHERE id = ?', req.params.id);
+// 미리보기: 업로드 완료된 명단 파일(file_id)을 읽어 검증만 수행한다. 학생·등록은 만들지 않는다.
+r.post('/courses/:id/imports/preview', A.requireAdmin, async (req, res) => {
+  const c = await get('SELECT * FROM courses WHERE id = ?', req.params.id);
   if (!c) throw E.notFound();
-  F.validate(req.file, F.ROSTER_TYPES, F.LIMITS.rosterBytes);
-  let wb;
-  try { wb = readWorkbook(req.file.buffer, F.safeName(req.file.originalname)); } catch (e) {
-    if (e.status) throw e;
-    throw E.invalid('파일을 읽을 수 없습니다. 표준 양식(.xlsx 또는 CSV)을 사용해주세요.');
-  }
-  const out = tx(() => {
-    const f = F.store(req.file, { types: F.ROSTER_TYPES, maxBytes: F.LIMITS.rosterBytes, purpose: 'roster', user: req.user });
+  const f = await F.loadOwnPending(req.user, req.body.file_id);
+  if (f.purpose !== 'roster' || f.status !== 'UPLOADED') throw E.invalid('명단 파일 업로드가 완료되지 않았습니다. 다시 시도해주세요.');
+  const buf = await storage().read(f.object_key);
+  const wb = readWorkbook(buf, f.original_name);
+  const out = await tx(async () => {
     const id = uuid();
-    run(`INSERT INTO import_jobs(id, course_id, uploaded_by, state, file_id, file_hash, original_name, sheet_names, created_at) VALUES(?,?,?,?,?,?,?,?,?)`,
-      id, c.id, req.user.id, 'PREVIEW', f.id, crypto.createHash('sha256').update(req.file.buffer).digest('hex'), f.original_name, JSON.stringify(wb.SheetNames), now());
-    const job = loadJob(id);
+    await run(`UPDATE file_assets SET status = 'ATTACHED' WHERE id = ?`, f.id);
+    await run(`INSERT INTO import_jobs(id, course_id, uploaded_by, state, file_id, file_hash, original_name, sheet_names, created_at) VALUES(?,?,?,?,?,?,?,?,?)`,
+      id, c.id, req.user.id, 'PREVIEW', f.id, crypto.createHash('sha256').update(buf).digest('hex'), f.original_name, JSON.stringify(wb.SheetNames), now());
+    const job = await loadJob(id);
     let mapping = null;
-    if (req.body.name_col !== undefined && req.body.phone_col !== undefined) mapping = { name: req.body.name_col, phone: req.body.phone_col, memo: req.body.memo_col ?? null };
-    loadRowsFromWorkbook(job, wb, req.body.sheet && wb.SheetNames.includes(req.body.sheet) ? req.body.sheet : wb.SheetNames[0], mapping);
-    return jobView(id);
+    if (req.body.name_col != null && req.body.phone_col != null) mapping = { name: req.body.name_col, phone: req.body.phone_col, memo: req.body.memo_col ?? null };
+    await loadRowsFromWorkbook(job, wb, req.body.sheet && wb.SheetNames.includes(req.body.sheet) ? req.body.sheet : wb.SheetNames[0], mapping);
+    return id;
   });
-  res.status(201).json(out);
+  res.status(201).json(await jobView(out));
 });
 
-r.post('/imports/:id/remap', A.requireAdmin, (req, res) => {
-  const out = tx(() => {
-    const job = loadJob(req.params.id);
+r.post('/imports/:id/remap', A.requireAdmin, async (req, res) => {
+  const job0 = await loadJob(req.params.id);
+  const { wb } = await readRosterFile(job0.file_id);
+  await tx(async () => {
+    const job = await loadJob(req.params.id, true);
     if (job.state !== 'PREVIEW') throw E.conflict('이미 확정된 업로드입니다.');
-    const f = get('SELECT * FROM file_assets WHERE id = ?', job.file_id);
-    const wb = readWorkbook(fs.readFileSync(F.objectPath(f)), f.original_name);
     const m = req.body.mapping || {};
     const toIdx = (v) => (v === null || v === undefined || v === '' ? null : Number(v));
-    loadRowsFromWorkbook(job, wb, req.body.sheet || job.sheet_name, { name: toIdx(m.name), phone: toIdx(m.phone), memo: toIdx(m.memo) });
-    return jobView(job.id);
+    await loadRowsFromWorkbook(job, wb, req.body.sheet || job.sheet_name, { name: toIdx(m.name), phone: toIdx(m.phone), memo: toIdx(m.memo) });
   });
-  res.json(out);
+  res.json(await jobView(req.params.id));
 });
 
-r.patch('/imports/:id/rows/:n', A.requireAdmin, (req, res) => {
-  const out = tx(() => {
-    const job = loadJob(req.params.id);
+r.patch('/imports/:id/rows/:n', A.requireAdmin, async (req, res) => {
+  await tx(async () => {
+    const job = await loadJob(req.params.id, true);
     if (job.state !== 'PREVIEW') throw E.conflict('이미 확정된 업로드입니다.');
-    const row = get('SELECT * FROM import_rows WHERE import_job_id = ? AND row_number = ?', job.id, Number(req.params.n));
+    const row = await get('SELECT * FROM import_rows WHERE import_job_id = ? AND row_number = ?', job.id, Number(req.params.n));
     if (!row) throw E.notFound();
-    run('UPDATE import_rows SET raw_name = ?, raw_phone = ?, memo = ?, excluded = ? WHERE import_job_id = ? AND row_number = ?',
+    await run('UPDATE import_rows SET raw_name = ?, raw_phone = ?, memo = ?, excluded = ? WHERE import_job_id = ? AND row_number = ?',
       req.body.name !== undefined ? U.str(req.body.name, 100) : row.raw_name,
       req.body.phone !== undefined ? U.str(req.body.phone, 40) : row.raw_phone,
       req.body.memo !== undefined ? U.str(req.body.memo, 1000) : row.memo,
       req.body.excluded !== undefined ? (req.body.excluded ? 1 : 0) : row.excluded, job.id, row.row_number);
-    classifyJob(job);
-    return jobView(job.id);
+    await classifyJob(job);
   });
-  res.json(out);
+  res.json(await jobView(req.params.id));
 });
 
-r.get('/imports/:id', A.requireAdmin, (req, res) => { loadJob(req.params.id); res.json(jobView(req.params.id)); });
-r.get('/courses/:id/imports', A.requireAdmin, (req, res) => {
-  res.json({ items: all(`SELECT id, state, original_name, counts, created_at, committed_at FROM import_jobs WHERE course_id = ? ORDER BY created_at DESC LIMIT 50`, req.params.id)
+r.get('/imports/:id', A.requireAdmin, async (req, res) => { await loadJob(req.params.id); res.json(await jobView(req.params.id)); });
+r.get('/courses/:id/imports', A.requireAdmin, async (req, res) => {
+  res.json({ items: (await all(`SELECT id, state, original_name, counts, created_at, committed_at FROM import_jobs WHERE course_id = ? ORDER BY created_at DESC LIMIT 50`, req.params.id))
     .map((j) => ({ ...j, counts: j.counts ? JSON.parse(j.counts) : null })) });
 });
 
-// 확정: 행 단위로 학생·인증·등록을 원자적으로 생성하고, 확정 시점에 재검사한다.
-r.post('/imports/:id/commit', A.requireAdmin, (req, res) => {
-  const job = tx(() => {
-    const j = loadJob(req.params.id);
-    if (j.state !== 'PREVIEW') return j; // 멱등: 이미 확정 중/완료면 현재 상태 반환
-    classifyJob(j);
-    run(`UPDATE import_jobs SET state = 'COMMITTING', idempotency_key = COALESCE(?, idempotency_key) WHERE id = ?`, U.str(req.body.idempotency_key, 100), j.id);
+// 확정: 서버리스 실행 시간 제한을 고려해 호출마다 시간 예산 안에서 일부 행을 처리한다.
+// 클라이언트는 state가 COMMITTING인 동안 같은 요청을 반복 호출한다(멱등). 각 행은 별도 트랜잭션으로
+// 학생·인증·등록을 원자적으로 만들고, 확정 시점에 다시 중복을 검사한다.
+const COMMIT_BUDGET_MS = Number(process.env.IMPORT_COMMIT_BUDGET_MS || 8000);
+r.post('/imports/:id/commit', A.requireAdmin, async (req, res) => {
+  const started = Date.now();
+  const job = await tx(async () => {
+    const j = await loadJob(req.params.id, true);
+    if (j.state !== 'PREVIEW') return j; // 이미 확정 중/완료면 그대로 진행
+    await classifyJob(j);
+    // 등록 대상이 아닌 행은 즉시 결과를 기록
+    await run(`UPDATE import_rows SET result = CASE WHEN classification IN ('ALREADY_ENROLLED','DUP_IN_FILE','EXCLUDED') THEN 'SKIPPED' ELSE 'FAILED' END,
+        result_message = COALESCE(error, CASE WHEN classification = 'EXCLUDED' THEN '관리자가 제외한 행입니다.' END)
+      WHERE import_job_id = ? AND classification NOT IN ('NEW','EXISTING_NEW_ENROLLMENT')`, j.id);
+    await run(`UPDATE import_jobs SET state = 'COMMITTING', idempotency_key = COALESCE(?, idempotency_key) WHERE id = ?`, U.str(req.body.idempotency_key, 100), j.id);
     return loadJob(j.id);
   });
-  if (job.state === 'COMMITTING' && !runningCommits.has(job.id)) {
-    const p = processCommit(req, job.id).catch((e) => console.error('import commit failed', e));
-    runningCommits.set(job.id, p);
-    p.finally(() => runningCommits.delete(job.id));
-  }
-  res.status(202).json(jobView(job.id));
+  if (job.state === 'COMMITTING') await processCommitChunk(req, job, started);
+  res.status(202).json(await jobView(job.id));
 });
-const runningCommits = new Map();
-r.locals = { runningCommits };
 
-async function processCommit(req, jobId) {
-  const job = loadJob(jobId);
-  const rows = all('SELECT * FROM import_rows WHERE import_job_id = ? ORDER BY row_number', jobId);
-  const hashes = new Map();
-  const toHash = rows.filter((x) => x.classification === 'NEW');
-  for (let i = 0; i < toHash.length; i += 16) {
-    await Promise.all(toHash.slice(i, i + 16).map(async (x) => hashes.set(x.normalized_phone, await A.hashPassword(x.normalized_phone, 'STUDENT'))));
-  }
-  const counts = { created: 0, linked: 0, skipped: 0, failed: 0 };
+async function processCommitChunk(req, job, started) {
   const actorReq = { user: req.user };
-  for (const row of rows) {
-    let result; let msg = null; let sid = null; let eid = null;
-    if (!COMMITTABLE.includes(row.classification)) {
-      result = ['ALREADY_ENROLLED', 'DUP_IN_FILE', 'EXCLUDED'].includes(row.classification) ? 'SKIPPED' : 'FAILED';
-      msg = row.error || (row.classification === 'EXCLUDED' ? '관리자가 제외한 행입니다.' : null);
-    } else {
-      try {
-        ({ result, msg, sid, eid } = tx(() => {
-          // 미리보기 후 다른 관리자가 먼저 등록한 경우 재검사
-          let s = get('SELECT * FROM students WHERE normalized_phone = ?', row.normalized_phone);
-          if (s && s.normalized_name !== row.normalized_name) return { result: 'FAILED', msg: '기존 수강생 정보와 이름이 다릅니다. 확인 후 등록해주세요.' };
-          if (s && s.status !== 'ACTIVE') return { result: 'FAILED', msg: '비활성화된 수강생입니다. 관리자 검토가 필요합니다.' };
-          let created = false;
-          if (!s) {
-            const h = hashes.get(row.normalized_phone);
-            if (!h) return { result: 'FAILED', msg: '처리 중 오류가 발생했습니다. 다시 시도해주세요.' };
-            s = createStudent(row.normalized_name, row.normalized_phone, h); created = true;
-            A.audit(actorReq, { courseId: job.course_id, targetType: 'STUDENT', targetId: s.id, action: 'STUDENT_CREATED', changed: { code: s.code, import_job: jobId } });
-          }
-          const ex = get('SELECT * FROM enrollments WHERE course_id = ? AND student_id = ?', job.course_id, s.id);
-          if (ex) return { result: 'SKIPPED', msg: ex.status === 'ACTIVE' ? '이미 등록된 수강생입니다. 기존 기록을 유지합니다.' : '재활성화가 필요합니다.', sid: s.id, eid: ex.id };
-          const e = createEnrollment(actorReq, job.course_id, s.id, row.memo, 'IMPORT');
-          return { result: created ? 'CREATED' : 'LINKED', msg: created ? '신규 학생 등록' : '기존 학생 연결', sid: s.id, eid: e };
-        }));
-      } catch (e) {
-        console.error(e);
-        result = 'FAILED'; msg = '처리 중 오류가 발생했습니다. 다시 시도해주세요.';
-      }
+  while (Date.now() - started < COMMIT_BUDGET_MS) {
+    const rows = await all('SELECT * FROM import_rows WHERE import_job_id = ? AND result IS NULL ORDER BY row_number LIMIT 50', job.id);
+    if (!rows.length) break;
+    const hashes = new Map();
+    const toHash = rows.filter((x) => x.classification === 'NEW');
+    for (let i = 0; i < toHash.length; i += 8) {
+      await Promise.all(toHash.slice(i, i + 8).map(async (x) => hashes.set(x.normalized_phone, await A.hashPassword(x.normalized_phone, 'STUDENT'))));
     }
-    counts[result.toLowerCase()]++;
-    run(`UPDATE import_rows SET result = ?, result_message = ?, student_id_optional = COALESCE(?, student_id_optional), enrollment_id_optional = COALESCE(?, enrollment_id_optional)
-      WHERE import_job_id = ? AND row_number = ?`, result, msg, sid, eid, jobId, row.row_number);
-    if (rows.length > 200) await new Promise((r2) => setImmediate(r2)); // 다른 요청 처리 양보
+    for (const row0 of rows) {
+      try {
+        await tx(async () => {
+          const row = await get('SELECT * FROM import_rows WHERE import_job_id = ? AND row_number = ? FOR UPDATE', job.id, row0.row_number);
+          if (row.result) return null; // 다른 호출이 이미 처리
+          let s = await get('SELECT * FROM students WHERE normalized_phone = ? FOR UPDATE', row.normalized_phone);
+          let o;
+          if (s && s.normalized_name !== row.normalized_name) o = { result: 'FAILED', msg: '기존 수강생 정보와 이름이 다릅니다. 확인 후 등록해주세요.' };
+          else if (s && s.status !== 'ACTIVE') o = { result: 'FAILED', msg: '비활성화된 수강생입니다. 관리자 검토가 필요합니다.' };
+          else {
+            let created = false;
+            if (!s) {
+              const h = hashes.get(row.normalized_phone) || await A.hashPassword(row.normalized_phone, 'STUDENT');
+              s = await createStudent(row.normalized_name, row.normalized_phone, h); created = true;
+              await A.audit(actorReq, { courseId: job.course_id, targetType: 'STUDENT', targetId: s.id, action: 'STUDENT_CREATED', changed: { code: s.code, import_job: job.id } });
+            }
+            const ex = await get('SELECT * FROM enrollments WHERE course_id = ? AND student_id = ?', job.course_id, s.id);
+            if (ex) o = { result: 'SKIPPED', msg: ex.status === 'ACTIVE' ? '이미 등록된 수강생입니다. 기존 기록을 유지합니다.' : '재활성화가 필요합니다.', sid: s.id, eid: ex.id };
+            else {
+              const eid = await createEnrollment(actorReq, job.course_id, s.id, row.memo, 'IMPORT');
+              o = { result: created ? 'CREATED' : 'LINKED', msg: created ? '신규 학생 등록' : '기존 학생 연결', sid: s.id, eid };
+            }
+          }
+          await run(`UPDATE import_rows SET result = ?, result_message = ?, student_id_optional = COALESCE(?, student_id_optional), enrollment_id_optional = COALESCE(?, enrollment_id_optional)
+            WHERE import_job_id = ? AND row_number = ?`, o.result, o.msg, o.sid, o.eid, job.id, row.row_number);
+          return o;
+        });
+      } catch (e) {
+        // 불완전한 학생·등록을 남기지 않도록 행 트랜잭션은 롤백되고, 실패 결과만 기록한다(재시도 가능)
+        console.error('import row failed', job.id, row0.row_number, e.message);
+        await run(`UPDATE import_rows SET result = 'FAILED', result_message = ? WHERE import_job_id = ? AND row_number = ? AND result IS NULL`,
+          '처리 중 오류가 발생했습니다. 다시 업로드해주세요.', job.id, row0.row_number);
+      }
+      if (Date.now() - started >= COMMIT_BUDGET_MS) break;
+    }
   }
-  run(`UPDATE import_jobs SET state = 'COMMITTED', counts = ?, committed_at = ? WHERE id = ?`, JSON.stringify(counts), now(), jobId);
-  A.audit(actorReq, { courseId: job.course_id, targetType: 'IMPORT', targetId: jobId, action: 'ROSTER_IMPORTED', changed: counts });
+  await tx(async () => {
+    const j = await loadJob(job.id, true);
+    if (j.state !== 'COMMITTING') return;
+    if ((await get('SELECT COUNT(*) AS n FROM import_rows WHERE import_job_id = ? AND result IS NULL', job.id)).n > 0) return;
+    const counts = { created: 0, linked: 0, skipped: 0, failed: 0 };
+    for (const x of await all('SELECT result, COUNT(*) AS n FROM import_rows WHERE import_job_id = ? GROUP BY result', job.id)) counts[x.result.toLowerCase()] = x.n;
+    await run(`UPDATE import_jobs SET state = 'COMMITTED', counts = ?, committed_at = ? WHERE id = ?`, JSON.stringify(counts), now(), job.id);
+    await A.audit(actorReq, { courseId: job.course_id, targetType: 'IMPORT', targetId: job.id, action: 'ROSTER_IMPORTED', changed: counts });
+  });
 }
 
 module.exports = r;
 module.exports.instructorsOf = instructorsOf;
-module.exports.processCommit = processCommit;
-module.exports.runningCommits = runningCommits;
