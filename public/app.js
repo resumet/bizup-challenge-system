@@ -6,14 +6,28 @@ const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '
 const APP = () => $('#app');
 let ME = null; let CSRF = '';
 
-const STATUS = {
-  NOT_STARTED: { icon: '○', label: '미시작' },
-  IN_PROGRESS: { icon: '◐', label: '진행 중' },
-  NEED_SUBMISSION: { icon: '!', label: '제출 필요' },
-  COMPLETED: { icon: '✓', label: '완료' },
-  COMPLETED_LATE: { icon: '✓', label: '기한 후 완료' },
+/* 아이콘: 이모지 대신 currentColor를 따르는 인라인 SVG (stroke 1.75 통일) */
+const ICON_PATHS = {
+  link: '<path d="M10 14a4 4 0 0 0 5.66 0l3-3a4 4 0 0 0-5.66-5.66l-1 1"/><path d="M14 10a4 4 0 0 0-5.66 0l-3 3a4 4 0 0 0 5.66 5.66l1-1"/>',
+  file: '<path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/>',
+  upload: '<path d="M12 15V4"/><path d="m7 9 5-5 5 5"/><path d="M5 15v3a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-3"/>',
+  lock: '<rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/>',
+  check: '<path d="m5 12.5 4.5 4.5L19 7.5"/>',
+  box: '<rect x="4.5" y="4.5" width="15" height="15" rx="3"/>',
+  checkbox: '<rect x="4.5" y="4.5" width="15" height="15" rx="3"/><path d="m8.5 12.2 2.4 2.4 4.6-4.8"/>',
 };
-const statusBadge = (s, long) => `<span class="badge st-${s}" title="${esc(STATUS[s].label)}">${STATUS[s].icon} ${long === false ? '' : esc(STATUS[s].label)}</span>`;
+const icon = (name, label) => `<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" ${label ? `role="img" aria-label="${esc(label)}"` : 'aria-hidden="true"'}>${ICON_PATHS[name]}</svg>`;
+
+const STATUS = {
+  NOT_STARTED: { label: '미시작' },
+  IN_PROGRESS: { label: '진행 중' },
+  NEED_SUBMISSION: { label: '제출 필요' },
+  COMPLETED: { label: '완료' },
+  COMPLETED_LATE: { label: '기한 후 완료' },
+};
+// long === false: 점만 표시 (매트릭스 셀). 라벨은 스크린리더·툴팁으로 유지
+const statusBadge = (s, long) => `<span class="badge st-${s}${long === false ? ' dot-only' : ''}" title="${esc(STATUS[s].label)}"><i class="dot" aria-hidden="true"></i>${long === false ? `<span class="sr">${esc(STATUS[s].label)}</span>` : esc(STATUS[s].label)}</span>`;
+const skeleton = (rows = 4) => `<div class="skeleton" aria-busy="true" aria-label="불러오는 중"><span class="sk sk-title"></span><span class="sk sk-line"></span>${'<span class="sk sk-block"></span>'.repeat(rows)}</div>`;
 const COURSE_STATE = { READY: '준비 중', ACTIVE: '진행 중', ENDED: '종료', ARCHIVED: '보관' };
 const courseStateBadge = (s) => `<span class="badge ${s === 'ACTIVE' ? 'ok' : s === 'READY' ? 'primary' : ''}">${COURSE_STATE[s]}</span>`;
 const PHASE = { UPCOMING: ['시작 전', 'primary'], RUNNING: ['진행 중', 'ok'], ENDED: ['종료', ''] };
@@ -188,7 +202,8 @@ async function loadMe() {
 }
 function renderTopbar() {
   const tb = $('#topbar');
-  if (!ME) { tb.innerHTML = `<div class="inner"><a class="brand" href="#/">비즈업클래스 챌린지</a></div>`; return; }
+  const brand = `<a class="brand" href="#/"><span class="mark" aria-hidden="true">B</span>비즈업클래스 <span class="brand-sub">챌린지</span></a>`;
+  if (!ME) { tb.innerHTML = `<div class="inner">${brand}</div>`; return; }
   const h = location.hash;
   const link = (href, label, match) => `<a href="${href}" class="${(match || ((x) => x.startsWith(href)))(h) ? 'on' : ''}">${label}</a>`;
   let nav = '';
@@ -200,9 +215,9 @@ function renderTopbar() {
     if (ME.isAdmin) nav += link('#/a/staff', '강사 관리') + link('#/a/students', '전체 학생', (x) => x.startsWith('#/a/students') || x.startsWith('#/a/st/')) + link('#/a/sources', '외부 연동') + link('#/a/logs', '변경 이력');
     nav += link('#/a/account', '내 계정');
   }
-  tb.innerHTML = `<div class="inner"><a class="brand" href="#/">비즈업클래스 챌린지</a><nav>${nav}</nav>
-    <span class="small muted hide-sm">${esc(ME.name)}${ME.type === 'STAFF' ? ` · ${ME.roles.map((r) => (r === 'ADMIN' ? '관리자' : '강사')).join('·')}` : ''}</span>
-    <button class="btn sm" id="logout">로그아웃</button></div>`;
+  tb.innerHTML = `<div class="inner">${brand}<nav>${nav}</nav>
+    <span class="who hide-sm"><span class="avatar" aria-hidden="true">${esc((ME.name || '?').slice(0, 1))}</span>${esc(ME.name)}${ME.type === 'STAFF' ? ` <span class="muted">${ME.roles.map((r) => (r === 'ADMIN' ? '관리자' : '강사')).join('·')}</span>` : ''}</span>
+    <button class="btn sm ghost" id="logout">로그아웃</button></div>`;
   $('#logout').addEventListener('click', logout);
 }
 async function logout() {
@@ -227,7 +242,7 @@ async function router() {
     if (r.opts.auth === 'ADMIN' && (!ME || !ME.isAdmin)) return (location.hash = ME ? '#/' : '#/staff-login');
     renderTopbar();
     APP().className = r.opts.narrow ? 'narrow' : '';
-    APP().innerHTML = '<p class="muted center pad">불러오는 중…</p>';
+    APP().innerHTML = skeleton(r.opts.narrow ? 3 : 4);
     try { await r.handler(params, query); } catch (e) {
       if (e.status === 401) return;
       APP().innerHTML = `<div class="card center pad"><p>${esc(errMsg(e))}</p><a class="btn" href="#/">처음으로</a></div>`;
@@ -368,8 +383,8 @@ function renderStudentAssignment(a) {
     </div>
     ${a.description ? `<div class="card"><h3>과제 안내</h3><div class="pre">${esc(a.description)}</div></div>` : ''}
     ${a.resources.length ? `<div class="card"><h3>강사 자료</h3><ul class="list">${a.resources.map((r) => `<li>${r.type === 'LINK'
-    ? `🔗 <a href="${esc(r.url)}" target="_blank" rel="noopener noreferrer">${esc(r.title)}</a>`
-    : `📎 <a href="/api/files/${r.file_id}/download">${esc(r.title)}</a> <span class="small muted">${fmtSize(r.size)}</span>`}</li>`).join('')}</ul></div>` : ''}
+    ? `${icon('link')} <a href="${esc(r.url)}" target="_blank" rel="noopener noreferrer">${esc(r.title)}</a>`
+    : `${icon('file')} <a href="/api/files/${r.file_id}/download">${esc(r.title)}</a> <span class="small muted">${fmtSize(r.size)}</span>`}</li>`).join('')}</ul></div>` : ''}
     <div class="card"><h3>해야 할 일 <span class="small muted">(${a.checked}/${a.item_count} 완료)</span></h3>
       <ul class="checklist">${a.items.map((it) => `<li class="${it.is_checked ? 'done' : ''}">
         <input type="checkbox" id="it-${it.id}" data-item="${it.id}" ${it.is_checked ? 'checked' : ''} ${locked ? 'disabled' : ''}>
@@ -378,14 +393,14 @@ function renderStudentAssignment(a) {
     <div class="card"><h3>결과물 제출 ${a.submission_required ? '<span class="badge warn">필수</span>' : '<span class="badge">선택</span>'}</h3>
       <p class="small muted">${a.submission_required ? '파일 또는 링크 중 1개 이상 제출하면 조건이 충족됩니다.' : '결과물 제출은 선택입니다.'} 파일 최대 ${a.limits.files}개(개당 ${a.limits.max_mb}MB), 링크 최대 ${a.limits.links}개</p>
       <ul class="list">${a.submissions.map((s) => `<li>
-        ${s.type === 'LINK' ? `🔗 <a class="grow" href="${esc(s.url)}" target="_blank" rel="noopener noreferrer" style="word-break:break-all">${esc(s.url)}</a>`
-    : `📎 <a class="grow" href="/api/files/${s.file_id}/download">${esc(s.original_name)}</a> <span class="small muted">${fmtSize(s.size)}</span>`}
+        ${s.type === 'LINK' ? `${icon('link')} <a class="grow" href="${esc(s.url)}" target="_blank" rel="noopener noreferrer" style="word-break:break-all">${esc(s.url)}</a>`
+    : `${icon('file')} <a class="grow" href="/api/files/${s.file_id}/download">${esc(s.original_name)}</a> <span class="small muted">${fmtSize(s.size)}</span>`}
         <span class="small muted">${fmtDT(s.revised_at)}${s.current_revision > 1 ? ` · 수정 ${s.current_revision - 1}회` : ''}</span>
         ${locked ? '' : `<button class="btn sm" data-edit-sub="${s.id}" data-type="${s.type}">${s.type === 'LINK' ? '수정' : '교체'}</button><button class="btn sm danger" data-del-sub="${s.id}">삭제</button>`}
       </li>`).join('') || '<li class="muted small">제출한 결과물이 없습니다.</li>'}</ul>
       ${locked ? '<p class="small muted mt">제출 기간이 종료되었습니다.</p>' : `
       <form id="link-form" class="row mt"><input class="grow" type="url" name="url" placeholder="https://" aria-label="제출 링크" ${hasLinks >= a.limits.links ? 'disabled' : ''} required><button class="btn" type="submit" ${hasLinks >= a.limits.links ? 'disabled' : ''}>링크 제출</button></form>
-      <div class="row mt"><label class="btn" for="file-input" style="margin:0" ${hasFiles >= a.limits.files ? 'aria-disabled="true"' : ''}>📷 사진·파일 제출</label>
+      <div class="row mt"><label class="btn" for="file-input" style="margin:0" ${hasFiles >= a.limits.files ? 'aria-disabled="true"' : ''}>${icon('upload')} 사진·파일 제출</label>
         <input type="file" id="file-input" accept="${a.limits.extensions.join(',')},image/*" style="position:absolute;left:-9999px" ${hasFiles >= a.limits.files ? 'disabled' : ''}>
         <span class="small muted" id="upload-state"></span></div>`}
     </div>

@@ -3,12 +3,15 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#fafafa">
   <title>비즈업클래스 챌린지</title>
+  <link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/variable/pretendardvariable-dynamic-subset.min.css">
   <link rel="stylesheet" href="/style.css">
 </head>
 <body>
   <header id="topbar"></header>
-  <main id="app" tabindex="-1"><p class="muted center pad">불러오는 중…</p></main>
+  <main id="app" tabindex="-1"><div class="skeleton" aria-busy="true" aria-label="불러오는 중"><span class="sk sk-title"></span><span class="sk sk-line"></span><span class="sk sk-block"></span><span class="sk sk-block"></span></div></main>
   <div id="toast" role="status" aria-live="polite"></div>
   <div id="modal-root"></div>
   <script src="/app.js"></script>
