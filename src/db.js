@@ -9,7 +9,10 @@ const crypto = require('crypto');
 const { AsyncLocalStorage } = require('async_hooks');
 
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, '..', 'data');
-const SCHEMA_FILE = path.join(__dirname, '..', 'supabase', 'migrations', '20261119000000_init.sql');
+const MIGRATIONS_DIR = path.join(__dirname, '..', 'supabase', 'migrations');
+// 모든 마이그레이션은 재실행해도 안전하게(IF NOT EXISTS) 작성하고 파일명 순서대로 적용한다.
+const schemaSql = () => fs.readdirSync(MIGRATIONS_DIR).filter((f) => f.endsWith('.sql')).sort()
+  .map((f) => fs.readFileSync(path.join(MIGRATIONS_DIR, f), 'utf8')).join('\n');
 const als = new AsyncLocalStorage();
 
 function toPg(sql) {
@@ -65,7 +68,7 @@ function createDriver() {
     if (url && url.startsWith('pglite:')) dataDir = url.slice('pglite:'.length) || undefined; // 'pglite:' = 메모리
     else { dataDir = path.join(DATA_DIR, 'pgdata'); fs.mkdirSync(DATA_DIR, { recursive: true }); }
     const db = new PGlite(dataDir, { parsers: { [types.INT8]: Number, [types.NUMERIC]: Number } });
-    await db.exec(fs.readFileSync(SCHEMA_FILE, 'utf8')); // 로컬은 시작 시 스키마 자동 적용
+    await db.exec(schemaSql()); // 로컬은 시작 시 스키마 자동 적용
     return {
       kind: 'pglite',
       query: async (sql, params) => (await db.query(sql, params)).rows,
@@ -108,7 +111,7 @@ async function nextCode(prefix) {
 
 async function migrate() {
   const d = await driver();
-  if (d.kind === 'pg') await d.exec(fs.readFileSync(SCHEMA_FILE, 'utf8'));
+  if (d.kind === 'pg') await d.exec(schemaSql());
 }
 async function close() {
   if (!driverPromise) return;

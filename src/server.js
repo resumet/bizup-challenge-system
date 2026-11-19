@@ -60,6 +60,7 @@ function createApp() {
   app.use('/api/me', require('./routes/student'));
   app.use('/api', require('./routes/admin'));
   app.use('/api', require('./routes/courses'));
+  app.use('/api', require('./routes/rosterSources'));
   app.use('/api', require('./routes/challenges'));
   app.use('/api', require('./routes/staffProgress'));
 
@@ -67,7 +68,8 @@ function createApp() {
   app.post('/api/files/prepare', A.requireUser, async (req, res) => {
     let purpose = req.user.type === 'STUDENT' ? 'submission' : 'resource';
     if (req.body.purpose === 'roster') {
-      if (!(req.user.type === 'STAFF' && req.user.isAdmin)) throw E.forbidden();
+      // 명단 파일: 관리자와 강사(배정 강의 확인은 미리보기 요청에서 수행)
+      if (req.user.type !== 'STAFF') throw E.forbidden();
       purpose = 'roster';
     }
     res.status(201).json(await F.prepare(req.user, { name: str(req.body.name, 300), size: req.body.size, purpose }));

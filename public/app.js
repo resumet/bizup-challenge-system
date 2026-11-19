@@ -197,7 +197,7 @@ function renderTopbar() {
   } else {
     if (ME.isAdmin) nav += link('#/a/dashboard', '대시보드');
     nav += link('#/a/courses', ME.isAdmin ? '강의' : '내 강의', (x) => x.startsWith('#/a/courses') || x.startsWith('#/a/c/') || x.startsWith('#/a/as/') || x.startsWith('#/a/e/') || x.startsWith('#/a/import'));
-    if (ME.isAdmin) nav += link('#/a/staff', '강사 관리') + link('#/a/students', '전체 학생', (x) => x.startsWith('#/a/students') || x.startsWith('#/a/st/')) + link('#/a/logs', '변경 이력');
+    if (ME.isAdmin) nav += link('#/a/staff', '강사 관리') + link('#/a/students', '전체 학생', (x) => x.startsWith('#/a/students') || x.startsWith('#/a/st/')) + link('#/a/sources', '외부 연동') + link('#/a/logs', '변경 이력');
     nav += link('#/a/account', '내 계정');
   }
   tb.innerHTML = `<div class="inner"><a class="brand" href="#/">비즈업클래스 챌린지</a><nav>${nav}</nav>

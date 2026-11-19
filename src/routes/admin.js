@@ -4,6 +4,7 @@ const { get, all, run, tx, uuid, now, nextCode } = require('../db');
 const U = require('../util');
 const { E } = U;
 const A = require('../auth');
+const { correctStudent } = require('../students');
 const P = require('../progress');
 const { isAssignedInstructor } = require('../access');
 
@@ -166,38 +167,7 @@ r.get('/students/:id', A.requireAdmin, async (req, res) => {
 r.patch('/students/:id', A.requireAdmin, async (req, res) => {
   const s = await get('SELECT * FROM students WHERE id = ?', req.params.id);
   if (!s) throw E.notFound();
-  const name = req.body.name !== undefined ? U.normalizeName(U.str(req.body.name, 50)) : s.normalized_name;
-  if (!name) throw E.invalid('이름을 입력해주세요.');
-  let phone = s.normalized_phone;
-  if (req.body.phone !== undefined) {
-    phone = U.normalizePhone(req.body.phone);
-    if (!phone) throw E.invalid(U.phoneError(req.body.phone));
-  }
-  const status = req.body.status !== undefined ? req.body.status : s.status;
-  if (!['ACTIVE', 'DISABLED'].includes(status)) throw E.invalid('상태 값이 올바르지 않습니다.');
-  const affected = (await get('SELECT COUNT(*) AS n FROM enrollments WHERE student_id = ?', s.id)).n;
-  const loginChanged = name !== s.normalized_name || phone !== s.normalized_phone;
-  if (req.body.dry_run) return res.json({ affected_courses: affected, login_changed: loginChanged });
-  const reason = (U.str(req.body.reason, 500) || '').trim();
-  if ((loginChanged || status !== s.status) && !reason) throw E.invalid('변경 사유를 입력해주세요.');
-  const DUP = '다른 수강생이 이미 사용 중인 전화번호입니다. 저장하지 않았습니다.';
-  if (phone !== s.normalized_phone && await get('SELECT id FROM students WHERE normalized_phone = ? AND id != ?', phone, s.id)) throw E.conflict(DUP);
-  const hash = phone !== s.normalized_phone ? await A.hashPassword(phone, 'STUDENT') : null;
-  const out = await tx(async () => {
-    const cur = await get('SELECT * FROM students WHERE id = ? FOR UPDATE', s.id);
-    if (phone !== cur.normalized_phone && await get('SELECT 1 AS ok FROM students WHERE normalized_phone = ? AND id != ?', phone, s.id)) throw E.conflict(DUP);
-    await run('UPDATE students SET name = ?, normalized_name = ?, normalized_phone = ?, status = ?, updated_at = ? WHERE id = ?', name, name, phone, status, now(), s.id);
-    if (hash) await run('UPDATE student_credentials SET password_hash = ?, credential_version = credential_version + 1 WHERE student_id = ?', hash, s.id);
-    else if (loginChanged) await run('UPDATE student_credentials SET credential_version = credential_version + 1 WHERE student_id = ?', s.id);
-    if (loginChanged || status === 'DISABLED') await A.revokeSubjectSessions('STUDENT', s.id);
-    const changed = {};
-    if (name !== cur.normalized_name) changed.name = [cur.name, name];
-    if (phone !== cur.normalized_phone) changed.phone = [U.maskPhone(cur.normalized_phone), U.maskPhone(phone)];
-    if (status !== cur.status) changed.status = [cur.status, status];
-    await A.audit(req, { targetType: 'STUDENT', targetId: s.id, action: 'STUDENT_CORRECTED', changed, reason, restricted: true });
-    return { id: s.id, affected_courses: affected };
-  });
-  res.json(out);
+  res.json(await correctStudent(req, s, req.body));
 });
 
 // ---------- 관리자 대시보드 ----------

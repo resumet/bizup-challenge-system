@@ -133,30 +133,36 @@ async function courseStudents(el, c, q) {
   const page = Number(q.page) || 1; const size = Number(q.size) || 50;
   const data = await GET(`/api/courses/${c.id}/enrollments` + qs({ q: q.q, status: q.status, page, size }));
   const go = (p) => { location.hash = `#/a/c/${c.id}/students` + qs({ ...q, ...p }); };
+  // 등록 방법: 관리자(개별·기존 학생 연결·엑셀·외부 API), 담당 강사(개별·엑셀)
   el.innerHTML = `<div class="row between mb">
       <form class="filters" id="flt" style="margin:0"><input type="search" name="q" placeholder="이름·학생번호${ME.isAdmin ? '·전화번호' : '·전화번호 4자리 이상'}" value="${esc(q.q || '')}">
       <select name="status"><option value="ACTIVE">활성 등록</option><option value="INACTIVE" ${q.status === 'INACTIVE' ? 'selected' : ''}>비활성 이력</option><option value="ALL" ${q.status === 'ALL' ? 'selected' : ''}>전체</option></select>
       <button class="btn" type="submit">검색</button></form>
-      ${ME.isAdmin ? '<div class="row"><a class="btn" href="/api/import-template.csv">양식 다운로드</a><button class="btn primary" id="upload">명단 업로드</button><button class="btn" id="add">개별 등록</button><button class="btn" id="link">기존 학생 연결</button></div>' : ''}
+      <div class="row"><a class="btn" href="/api/import-template.csv">양식 다운로드</a><button class="btn primary" id="upload">엑셀 업로드</button><button class="btn" id="add">개별 등록</button>
+      ${ME.isAdmin ? '<button class="btn" id="link">기존 학생 연결</button><button class="btn" id="api-import">외부 API 가져오기</button>' : ''}</div>
     </div>
-    <div class="table-wrap"><table><thead><tr><th>학생 번호</th><th>이름</th><th>전화번호</th><th>상태</th><th class="num">완료/공개 과제</th><th class="num">미확인 피드백</th>${ME.isAdmin ? '<th></th>' : ''}</tr></thead>
+    <div class="table-wrap"><table><thead><tr><th>학생 번호</th><th>이름</th><th>전화번호</th><th>상태</th><th class="num">완료/공개 과제</th><th class="num">미확인 피드백</th><th></th></tr></thead>
     <tbody>${data.items.map((e) => `<tr class="click" data-href="#/a/e/${e.id}">
       <td>${esc(e.student.code)}</td><td>${esc(e.student.name)}</td><td>${esc(e.student.phone)}</td>
-      <td>${e.status === 'ACTIVE' ? '<span class="badge ok">활성</span>' : `<span class="badge danger">비활성</span>${ME.isAdmin && e.reason ? ` <span class="small muted">${esc(e.reason)}</span>` : ''}`}${e.student.status !== 'ACTIVE' ? ' <span class="badge danger">학생 비활성</span>' : ''}</td>
+      <td>${e.status === 'ACTIVE' ? '<span class="badge ok">활성</span>' : `<span class="badge danger">비활성</span>${e.reason ? ` <span class="small muted">${esc(e.reason)}</span>` : ''}`}${e.student.status !== 'ACTIVE' ? ' <span class="badge danger">학생 비활성</span>' : ''}</td>
       <td class="num">${e.progress.total ? `${e.progress.completed}/${e.progress.total} (${pctText(e.progress.rate)})` : '과제 없음'}</td>
       <td class="num">${e.unread_feedback || ''}</td>
-      ${ME.isAdmin ? `<td class="num"><button class="btn sm ${e.status === 'ACTIVE' ? 'danger' : ''}" data-toggle="${e.id}" data-status="${e.status}">${e.status === 'ACTIVE' ? '비활성화' : '재활성화'}</button></td>` : ''}</tr>`).join('')
+      <td class="num nowrap"><button class="btn sm" data-edit="${e.id}">수정</button>
+        <button class="btn sm ${e.status === 'ACTIVE' ? 'danger' : ''}" data-toggle="${e.id}" data-status="${e.status}">${e.status === 'ACTIVE' ? '비활성화' : '재활성화'}</button>
+        <button class="btn sm danger" data-del="${e.id}">삭제</button></td></tr>`).join('')
       || `<tr><td colspan="7" class="center muted">${q.q ? '검색 결과가 없습니다.' : '수강생 없음'}</td></tr>`}</tbody></table></div>`;
   el.appendChild(pagination(data.total, data.page, data.size, (p, s) => go({ page: p, size: s })));
   $('#flt').addEventListener('submit', (e) => { e.preventDefault(); go({ ...formData(e.target), page: 1 }); });
   $$('tr[data-href]', el).forEach((tr) => tr.addEventListener('click', (e) => { if (e.target.closest('button')) return; location.hash = tr.dataset.href; }));
-  if (!ME.isAdmin) return;
+  const byId = (id) => data.items.find((x) => x.id === id);
   $$('[data-toggle]', el).forEach((b) => b.addEventListener('click', () => toggleEnrollment(b.dataset.toggle, b.dataset.status)));
+  $$('[data-edit]', el).forEach((b) => b.addEventListener('click', () => editEnrollmentStudent(byId(b.dataset.edit))));
+  $$('[data-del]', el).forEach((b) => b.addEventListener('click', () => deleteEnrollment(byId(b.dataset.del))));
   $('#add').addEventListener('click', () => {
     const m = modal(`<h2>개별 등록</h2><p class="small muted">${courseName(c)}</p><form id="af">
       <div class="field"><label>이름 *</label><input type="text" name="name" required maxlength="50"></div>
-      <div class="field"><label>전화번호 *</label><input type="tel" name="phone" required placeholder="010-1234-5678"><div class="hint">같은 번호의 기존 학생이 있으면 해당 학생을 이 강의에 연결합니다.</div></div>
-      <div class="field"><label>수강 등록 메모 (관리자 전용)</label><input type="text" name="memo" maxlength="1000"></div>
+      <div class="field"><label>전화번호 *</label><input type="tel" name="phone" required placeholder="010-1234-5678"><div class="hint">같은 번호의 기존 학생이 있으면 해당 학생을 이 강의에 연결합니다. 학생은 이름과 전화번호로 로그인합니다.</div></div>
+      ${ME.isAdmin ? '<div class="field"><label>수강 등록 메모 (관리자 전용)</label><input type="text" name="memo" maxlength="1000"></div>' : ''}
       <p class="form-error small" style="color:var(--danger)"></p>
       <div class="actions"><button type="button" class="btn" data-close>취소</button><button class="btn primary" type="submit">등록</button></div></form>`);
     bindForm($('#af', m.el), async (d) => {
@@ -168,6 +174,19 @@ async function courseStudents(el, c, q) {
       }
     });
   });
+  $('#upload').addEventListener('click', () => {
+    const m = modal(`<h2>엑셀로 명단 등록</h2><p class="small">대상 강의: ${courseName(c)}</p>
+      <p class="small muted">.xlsx 또는 .csv (최대 10MB, 5,000행). 필수 열: 이름, 전화번호${ME.isAdmin ? ' / 선택 열: 수강 등록 메모' : ''}. 전화번호 열은 텍스트 형식으로 저장해주세요. 미리보기 단계에서는 실제 등록이 일어나지 않습니다.</p>
+      <form id="uf"><div class="field"><input type="file" name="file" accept=".xlsx,.csv" required></div>
+      <p class="form-error small" style="color:var(--danger)"></p>
+      <div class="actions"><button type="button" class="btn" data-close>취소</button><button class="btn primary" type="submit">미리보기</button></div></form>`);
+    bindForm($('#uf', m.el), async (_d, form) => {
+      const f = await uploadFile(form.file.files[0], 'roster');
+      const job = await POST(`/api/courses/${c.id}/imports/preview`, { file_id: f.id });
+      m.close(); location.hash = '#/a/import/' + job.id;
+    });
+  });
+  if (!ME.isAdmin) return;
   $('#link').addEventListener('click', () => {
     const m = modal(`<h2>기존 학생 연결</h2><form id="sf" class="row"><input class="grow" type="search" name="q" placeholder="이름·학생번호·전화번호" required><button class="btn" type="submit">검색</button></form><ul class="list mt" id="sr"></ul>
       <div class="actions"><button class="btn" data-close>닫기</button></div>`, { wide: true });
@@ -180,18 +199,52 @@ async function courseStudents(el, c, q) {
       }));
     });
   });
-  $('#upload').addEventListener('click', () => {
-    const m = modal(`<h2>수강생 명단 업로드</h2><p class="small">대상 강의: ${courseName(c)}</p>
-      <p class="small muted">.xlsx 또는 .csv (최대 10MB, 5,000행). 필수 열: 이름, 전화번호 / 선택 열: 수강 등록 메모. 전화번호 열은 텍스트 형식으로 저장해주세요. 미리보기 단계에서는 실제 등록이 일어나지 않습니다.</p>
-      <form id="uf"><div class="field"><input type="file" name="file" accept=".xlsx,.csv" required></div>
+  $('#api-import').addEventListener('click', async () => {
+    const sources = (await GET('/api/roster-sources')).items.filter((s) => s.status === 'ACTIVE');
+    if (!sources.length) {
+      if (await confirmModal('등록된 외부 연동 소스가 없습니다. 연동 소스를 먼저 등록할까요?', { okText: '외부 연동 설정으로' })) location.hash = '#/a/sources';
+      return;
+    }
+    const m = modal(`<h2>외부 API에서 명단 가져오기</h2><p class="small">대상 강의: ${courseName(c)} <span class="muted">(${esc(c.code)})</span></p>
+      <form id="pf"><div class="field"><label>연동 소스 *</label><select name="source_id" required>${sources.map((s) => `<option value="${s.id}">${esc(s.name)}</option>`).join('')}</select></div>
+      <div class="field"><label>추가 값 <span class="muted">{param}</span></label><input type="text" name="param" maxlength="200" placeholder="예: 외부 시스템의 상품 번호"><div class="hint">연동 소스 주소·본문에 {param}이 있으면 이 값으로 바뀝니다. {course_code}는 이 강의 번호로 자동 입력됩니다.</div></div>
+      <p class="small muted">가져온 명단은 엑셀 업로드와 같은 미리보기 화면에서 확인한 뒤 등록을 확정합니다.</p>
       <p class="form-error small" style="color:var(--danger)"></p>
-      <div class="actions"><button type="button" class="btn" data-close>취소</button><button class="btn primary" type="submit">미리보기</button></div></form>`);
-    bindForm($('#uf', m.el), async (_d, form) => {
-      const f = await uploadFile(form.file.files[0], 'roster');
-      const job = await POST(`/api/courses/${c.id}/imports/preview`, { file_id: f.id });
+      <div class="actions"><button type="button" class="btn" data-close>취소</button><button class="btn primary" type="submit">가져와서 미리보기</button></div></form>`);
+    bindForm($('#pf', m.el), async (d) => {
+      const job = await POST(`/api/courses/${c.id}/imports/api`, d);
       m.close(); location.hash = '#/a/import/' + job.id;
     });
   });
+}
+// 수강생 이름·전화번호 수정 (관리자·담당 강사). 학생 정보는 모든 강의에서 공유된다.
+function editEnrollmentStudent(e) {
+  const m = modal(`<h2>수강생 정보 수정</h2><p class="small muted">${esc(e.student.code)} · 현재 전화번호 ${esc(e.student.phone)}</p><form id="ef">
+    <div class="field"><label>이름 *</label><input type="text" name="name" value="${esc(e.student.name)}" required maxlength="50"></div>
+    <div class="field"><label>새 전화번호</label><input type="tel" name="phone" placeholder="바꿀 때만 입력 (예: 010-1234-5678)"></div>
+    <div class="field"><label>변경 사유 *</label><input type="text" name="reason" required maxlength="500" placeholder="예: 전화번호 오타"></div>
+    <p class="notice warn small">이름·전화번호는 학생의 로그인 정보입니다. 바꾸면 학생은 새 정보로 다시 로그인해야 하고, 이 학생이 수강하는 모든 강의에 반영됩니다.${ME.isAdmin ? '' : ' 다른 강사의 강의에도 등록된 학생은 관리자만 수정할 수 있습니다.'}</p>
+    <p class="form-error small" style="color:var(--danger)"></p>
+    <div class="actions"><button type="button" class="btn" data-close>취소</button><button class="btn primary" type="submit">저장</button></div></form>`);
+  bindForm($('#ef', m.el), async (d) => {
+    const r = await PATCH(`/api/enrollments/${e.id}/student`, { name: d.name, phone: d.phone || undefined, reason: d.reason });
+    m.close(); toast(r.changed === false ? '바뀐 내용이 없습니다.' : '수정했습니다.'); rerender();
+  });
+}
+// 수강 등록 삭제: 수행 기록이 없을 때만. 기록이 있으면 비활성화를 안내한다.
+async function deleteEnrollment(e, onDeleted = rerender) {
+  if (!(await confirmModal(`${e.student.name} (${e.student.code}) 수강생의 이 강의 등록을 삭제할까요?\n잘못 등록한 경우에 사용합니다. 다른 강의 등록이 없으면 학생 정보도 함께 삭제되며 되돌릴 수 없습니다.`, { okText: '삭제', danger: true }))) return;
+  try {
+    const r = await DEL(`/api/enrollments/${e.id}`);
+    toast(r.student_deleted ? '등록과 학생 정보를 삭제했습니다.' : '이 강의 등록을 삭제했습니다.'); onDeleted();
+  } catch (ex) {
+    if (ex.body && ex.body.reason === 'HAS_ACTIVITY') {
+      if (e.status === 'ACTIVE' && await confirmModal(ex.message + '\n지금 비활성화할까요?', { okText: '비활성화로 진행' })) toggleEnrollment(e.id, 'ACTIVE');
+      else if (e.status !== 'ACTIVE') toast(ex.message, true);
+      return;
+    }
+    toast(errMsg(ex), true);
+  }
 }
 async function toggleEnrollment(id, status) {
   if (status === 'ACTIVE') {
@@ -222,10 +275,14 @@ route('/a/import/:id', async ({ id }, q) => {
   const filter = q.f || 'ALL';
   const rows = job.rows.filter((r) => filter === 'ALL' || (filter === 'ISSUE' ? !['NEW', 'EXISTING_NEW_ENROLLMENT'].includes(r.classification) : r.classification === filter));
   const committed = job.state === 'COMMITTED';
-  APP().innerHTML = `<div class="breadcrumb"><a href="#/a/c/${job.course_id}/students">${esc(job.course_title)} ${esc(job.cohort_label)}</a> › 명단 업로드</div>
-    <h1>명단 업로드 ${committed ? '결과' : job.state === 'COMMITTING' ? '처리 중' : '미리보기'}</h1>
-    <p class="small muted">파일: ${esc(job.original_name)} · 대상 강의: ${esc(job.course_code)} ${esc(job.course_title)} ${esc(job.cohort_label)}</p>
-    ${job.state === 'PREVIEW' ? `<div class="card"><h3>시트·열 매핑</h3><form id="mf" class="row">
+  const isApi = job.source_type === 'API';
+  const label = isApi ? '외부 API 명단' : '명단 업로드';
+  APP().innerHTML = `<div class="breadcrumb"><a href="#/a/c/${job.course_id}/students">${esc(job.course_title)} ${esc(job.cohort_label)}</a> › ${label}</div>
+    <h1>${label} ${committed ? '결과' : job.state === 'COMMITTING' ? '처리 중' : '미리보기'}</h1>
+    <p class="small muted">${isApi ? '출처' : '파일'}: ${esc(job.original_name)} · 대상 강의: ${esc(job.course_code)} ${esc(job.course_title)} ${esc(job.cohort_label)}</p>
+    ${job.state === 'PREVIEW' && isApi ? `<div class="card small">응답 필드: 이름 <code>${esc(job.mapping.name)}</code> · 전화번호 <code>${esc(job.mapping.phone)}</code>${job.mapping.memo ? ` · 메모 <code>${esc(job.mapping.memo)}</code>` : ''}
+      ${ME.isAdmin ? ' — 필드가 맞지 않으면 <a href="#/a/sources">외부 연동</a>에서 고친 뒤 다시 가져오세요.' : ''}</div>` : ''}
+    ${job.state === 'PREVIEW' && !isApi ? `<div class="card"><h3>시트·열 매핑</h3><form id="mf" class="row">
       <label class="inline">시트 <select name="sheet">${job.sheet_names.map((s) => `<option ${s === job.sheet_name ? 'selected' : ''}>${esc(s)}</option>`).join('')}</select></label>
       ${['name', 'phone', 'memo'].map((k) => `<label class="inline">${{ name: '이름 *', phone: '전화번호 *', memo: '메모' }[k]} <select name="${k}"><option value="">(없음)</option>${job.headers.map((h, i) => `<option value="${i}" ${job.mapping[k] === i || String(job.mapping[k]) === String(i) ? 'selected' : ''}>${esc(h || `${i + 1}열`)}</option>`).join('')}</select></label>`).join('')}
       <button class="btn" type="submit">다시 검사</button></form>
@@ -252,7 +309,7 @@ route('/a/import/:id', async ({ id }, q) => {
     return;
   }
   if (job.state !== 'PREVIEW') return;
-  $('#mf').addEventListener('submit', async (e) => {
+  if ($('#mf')) $('#mf').addEventListener('submit', async (e) => {
     e.preventDefault(); const d = formData(e.target);
     try { await POST(`/api/imports/${id}/remap`, { sheet: d.sheet, mapping: { name: d.name, phone: d.phone, memo: d.memo } }); rerender(); } catch (ex) { toast(errMsg(ex), true); }
   });
@@ -265,7 +322,7 @@ route('/a/import/:id', async ({ id }, q) => {
       <div class="field"><label>이름</label><input type="text" name="name" value="${esc(r.raw_name)}"></div>
       <div class="field"><label>전화번호</label><input type="text" name="phone" value="${esc(r.raw_phone)}"></div>
       <div class="field"><label>메모</label><input type="text" name="memo" value="${esc(r.memo || '')}"></div>
-      <p class="small muted">기존 학생의 이름·전화번호는 명단 업로드로 덮어쓰지 않습니다. 기존 정보가 틀렸다면 전체 학생 관리에서 정정하세요.</p>
+      <p class="small muted">기존 학생의 이름·전화번호는 명단 업로드로 덮어쓰지 않습니다. 기존 정보가 틀렸다면 수강생 목록의 수정 기능${ME.isAdmin ? '이나 전체 학생 관리' : ''}에서 정정하세요.</p>
       <p class="form-error small" style="color:var(--danger)"></p>
       <div class="actions"><button type="button" class="btn" data-close>취소</button><button class="btn primary" type="submit">다시 검사</button></div></form>`);
     bindForm($('#rf', m.el), async (d) => { await PATCH(`/api/imports/${id}/rows/${r.row_number}`, d); m.close(); rerender(); });
@@ -274,7 +331,73 @@ route('/a/import/:id', async ({ id }, q) => {
     if (!(await confirmModal(`${job.committable}건을 ${job.course_title} ${job.cohort_label}에 등록합니다. 확정 시점에 중복 여부를 다시 검사합니다.`, { okText: '등록 확정' }))) return;
     try { await POST(`/api/imports/${id}/commit`, { idempotency_key: id }); rerender(); } catch (e) { toast(errMsg(e), true); }
   });
+}, { auth: 'STAFF' });
+
+/* 외부 명단 API 연동 소스 (관리자) */
+route('/a/sources', async () => {
+  const { items } = await GET('/api/roster-sources');
+  APP().innerHTML = `<div class="row between mb"><h1>외부 명단 연동</h1><button class="btn primary" id="new-src">+ 연동 소스 추가</button></div>
+    <p class="small muted">결제·회원 시스템 등 외부 DB의 API에서 수강생 명단을 가져옵니다. 강의의 수강생 탭에서 <strong>외부 API 가져오기</strong>로 사용하며, 가져온 명단은 미리보기에서 확인한 뒤 확정해야 등록됩니다.</p>
+    <div class="table-wrap"><table><thead><tr><th>이름</th><th>요청</th><th>필드 (이름 / 전화번호 / 메모)</th><th>인증 헤더</th><th>상태</th><th>마지막 사용</th><th></th></tr></thead><tbody>
+    ${items.map((s) => `<tr><td><strong>${esc(s.name)}</strong></td><td class="small" style="word-break:break-all"><span class="badge">${esc(s.method)}</span> ${esc(s.url)}${s.items_path ? `<br><span class="muted">목록: ${esc(s.items_path)}</span>` : ''}</td>
+      <td class="small"><code>${esc(s.name_field)}</code> / <code>${esc(s.phone_field)}</code> / ${s.memo_field ? `<code>${esc(s.memo_field)}</code>` : '-'}</td>
+      <td class="small">${s.header_names.map((h) => `${esc(h)}: ••••`).join('<br>') || '-'}</td>
+      <td>${s.status === 'ACTIVE' ? '<span class="badge ok">사용</span>' : '<span class="badge">중지</span>'}</td><td class="small">${s.last_used_at ? fmtDT(s.last_used_at) : '-'}</td>
+      <td class="num nowrap"><button class="btn sm" data-test="${s.id}">연결 테스트</button> <button class="btn sm" data-edit="${s.id}">수정</button> <button class="btn sm danger" data-del="${s.id}">삭제</button></td></tr>`).join('')
+      || '<tr><td colspan="7" class="center muted">등록된 연동 소스가 없습니다.</td></tr>'}</tbody></table></div>`;
+  $('#new-src').addEventListener('click', () => sourceModal());
+  $$('[data-edit]').forEach((b) => b.addEventListener('click', () => sourceModal(items.find((x) => x.id === b.dataset.edit))));
+  $$('[data-del]').forEach((b) => b.addEventListener('click', async () => {
+    if (!(await confirmModal('연동 소스를 삭제할까요? 이미 등록된 수강생에는 영향이 없습니다.', { okText: '삭제', danger: true }))) return;
+    try { await DEL('/api/roster-sources/' + b.dataset.del); toast('삭제했습니다.'); rerender(); } catch (e) { toast(errMsg(e), true); }
+  }));
+  $$('[data-test]').forEach((b) => b.addEventListener('click', () => sourceTestModal(items.find((x) => x.id === b.dataset.test))));
 }, { auth: 'ADMIN' });
+
+function sourceModal(src) {
+  const s = src || { method: 'GET', header_names: [] };
+  const headerRow = (name = '', saved = false) => `<div class="row hdr"><input type="text" class="grow" data-h="name" placeholder="헤더 이름 (예: Authorization)" value="${esc(name)}">
+    <input type="password" class="grow" data-h="value" autocomplete="new-password" placeholder="${saved ? '저장된 값 유지 (바꿀 때만 입력)' : '값 (예: Bearer …)'}"><button type="button" class="btn sm" data-rm>삭제</button></div>`;
+  const m = modal(`<h2>${src ? '연동 소스 수정' : '연동 소스 추가'}</h2><form id="sf">
+    <div class="field"><label>이름 *</label><input type="text" name="name" value="${esc(s.name || '')}" required maxlength="100" placeholder="예: 결제 시스템 수강생 API"></div>
+    <div class="row"><div class="field" style="width:110px"><label>방식</label><select name="method">${['GET', 'POST'].map((x) => `<option ${s.method === x ? 'selected' : ''}>${x}</option>`).join('')}</select></div>
+      <div class="field grow"><label>API 주소 *</label><input type="url" name="url" value="${esc(s.url || '')}" required placeholder="https://api.example.com/students?course={course_code}"></div></div>
+    <div class="hint mb">자리표시자: <code>{course_code}</code> 강의 번호 · <code>{course_title}</code> 강의명 · <code>{cohort_label}</code> 기수 · <code>{param}</code> 가져올 때 입력하는 값. https 주소만 사용할 수 있습니다.</div>
+    <div class="field"><label>인증 헤더</label><div id="hdrs">${s.header_names.map((h) => headerRow(h, true)).join('')}</div><button type="button" class="btn sm mt" id="add-h">+ 헤더 추가</button>
+      <div class="hint">저장된 값은 다시 표시되지 않습니다.</div></div>
+    <div class="field"><label>요청 본문 (POST, JSON)</label><textarea name="body_template" rows="3" placeholder='{"courseCode": "{course_code}"}'>${esc(s.body_template || '')}</textarea></div>
+    <div class="field"><label>목록 위치</label><input type="text" name="items_path" value="${esc(s.items_path || '')}" placeholder="예: data.students (응답 자체가 배열이면 비움)"></div>
+    <div class="row"><div class="field grow"><label>이름 필드 *</label><input type="text" name="name_field" value="${esc(s.name_field || '')}" required placeholder="예: name 또는 profile.name"></div>
+      <div class="field grow"><label>전화번호 필드 *</label><input type="text" name="phone_field" value="${esc(s.phone_field || '')}" required placeholder="예: phone"></div>
+      <div class="field grow"><label>메모 필드</label><input type="text" name="memo_field" value="${esc(s.memo_field || '')}" placeholder="선택"></div></div>
+    ${src ? `<div class="field"><label class="inline"><input type="checkbox" name="active" ${s.status === 'ACTIVE' ? 'checked' : ''}> 사용</label></div>` : ''}
+    <p class="form-error small" style="color:var(--danger)"></p>
+    <div class="actions"><button type="button" class="btn" data-close>취소</button><button class="btn primary" type="submit">저장</button></div></form>`, { wide: true });
+  const bindRm = () => $$('[data-rm]', m.el).forEach((b) => { b.onclick = () => b.closest('.hdr').remove(); });
+  $('#add-h', m.el).addEventListener('click', () => { $('#hdrs', m.el).insertAdjacentHTML('beforeend', headerRow()); bindRm(); });
+  bindRm();
+  bindForm($('#sf', m.el), async (d, form) => {
+    const headers = $$('.hdr', form).map((row) => ({ name: $('[data-h=name]', row).value.trim(), value: $('[data-h=value]', row).value })).filter((h) => h.name);
+    const body = { name: d.name, method: d.method, url: d.url, body_template: d.body_template, items_path: d.items_path, name_field: d.name_field, phone_field: d.phone_field, memo_field: d.memo_field, headers };
+    if (src) { body.status = form.active.checked ? 'ACTIVE' : 'DISABLED'; await PATCH('/api/roster-sources/' + src.id, body); } else await POST('/api/roster-sources', body);
+    m.close(); toast('저장했습니다.'); rerender();
+  });
+}
+
+async function sourceTestModal(src) {
+  const courses = (await GET('/api/courses')).items;
+  const m = modal(`<h2>연결 테스트 — ${esc(src.name)}</h2><p class="small muted">실제로 API를 호출해 응답을 확인합니다. 수강생은 등록되지 않습니다.</p>
+    <form id="tf" class="row"><select name="course_id" class="grow"><option value="">강의 선택 (자리표시자용, 선택)</option>${courses.map((c) => `<option value="${c.id}">${esc(c.code)} ${esc(c.title)} ${esc(c.cohort_label)}</option>`).join('')}</select>
+      <input type="text" name="param" placeholder="{param} 값 (선택)"><button class="btn primary" type="submit">테스트</button></form>
+    <p class="form-error small" style="color:var(--danger)"></p><div id="tr" class="mt"></div>
+    <div class="actions"><button class="btn" data-close>닫기</button></div>`, { wide: true });
+  bindForm($('#tf', m.el), async (d) => {
+    const r = await POST(`/api/roster-sources/${src.id}/test`, d);
+    $('#tr', m.el).innerHTML = `<p><strong>${r.total}명</strong> 응답 · 이름·전화번호가 올바른 행 <strong>${r.valid}명</strong></p>
+      <p class="small muted">첫 항목의 필드: ${r.keys.map((k) => `<code>${esc(k)}</code>`).join(' ') || '-'}</p>
+      <div class="table-wrap"><table><thead><tr><th>이름</th><th>전화번호</th><th>메모</th></tr></thead><tbody>${r.sample.map((x) => `<tr><td>${esc(x.name) || '<span class="badge danger">비어 있음</span>'}</td><td>${esc(x.phone) || '<span class="badge danger">비어 있음</span>'}</td><td class="small">${esc(x.memo || '')}</td></tr>`).join('') || '<tr><td colspan="3" class="center muted">항목 없음</td></tr>'}</tbody></table></div>`;
+  });
+}
 
 /* 챌린지 관리 */
 async function courseChallenges(el, c) {
@@ -495,7 +618,8 @@ route('/a/e/:id', async ({ id }) => {
         <dt>등록일</dt><dd>${fmtDT(d.enrollment.enrolled_at)}</dd>${d.enrollment.deactivated_at ? `<dt>비활성화</dt><dd>${fmtDT(d.enrollment.deactivated_at)} ${esc(d.enrollment.reason || '')}</dd>` : ''}
         ${ME.isAdmin ? `<dt>등록 메모</dt><dd class="pre">${esc(d.enrollment.admin_memo || '-')}</dd>` : ''}</dl>
         <div class="row mt">${d.can_reveal_login ? '<button class="btn" id="reveal">로그인 정보 확인</button>' : '<span class="small muted">비활성 수강생의 로그인 정보는 확인할 수 없습니다.</span>'}
-        ${ME.isAdmin ? `<a class="btn" href="#/a/st/${d.student.id}">전체 학생 정보</a><button class="btn ${d.enrollment.status === 'ACTIVE' ? 'danger' : ''}" id="toggle">${d.enrollment.status === 'ACTIVE' ? '등록 비활성화' : '재활성화'}</button>` : ''}</div>
+        ${ME.isAdmin ? `<a class="btn" href="#/a/st/${d.student.id}">전체 학생 정보</a>` : ''}<button class="btn" id="edit-st">정보 수정</button>
+        <button class="btn ${d.enrollment.status === 'ACTIVE' ? 'danger' : ''}" id="toggle">${d.enrollment.status === 'ACTIVE' ? '등록 비활성화' : '재활성화'}</button><button class="btn danger" id="del-en">등록 삭제</button></div>
         <p class="small muted" id="reveal-box"></p></div>
       <div class="card"><h2>${ME.isAdmin ? '다른 수강 이력' : '내가 담당하는 다른 강의 수강 이력'}</h2><ul class="list">${d.other_enrollments.map((o) => `<li><a href="#/a/e/${o.id}">${esc(o.code)} ${esc(o.title)} ${esc(o.cohort_label)}</a> ${o.status === 'ACTIVE' ? '' : '<span class="badge danger">비활성</span>'}</li>`).join('') || '<li class="muted small">없음</li>'}</ul></div>
     </div>
@@ -523,8 +647,11 @@ route('/a/e/:id', async ({ id }) => {
   if (rv) rv.addEventListener('click', async () => {
     try { const r = await POST(`/api/enrollments/${id}/login-info/reveal`); $('#phone').innerHTML = `<strong>${esc(r.phone_display)}</strong>`; $('#reveal-box').textContent = `로그인 아이디: ${r.login_id} / 비밀번호: ${r.login_password} — 조회 이력이 기록되었습니다.`; } catch (e) { toast(errMsg(e), true); }
   });
-  const tg = $('#toggle');
-  if (tg) tg.addEventListener('click', () => toggleEnrollment(id, d.enrollment.status));
+  const enr = { id, status: d.enrollment.status, student: d.student };
+  $('#toggle').addEventListener('click', () => toggleEnrollment(id, d.enrollment.status));
+  $('#edit-st').addEventListener('click', () => editEnrollmentStudent(enr));
+  // 삭제되면 이 화면은 더 이상 없으므로 수강생 목록으로 이동
+  $('#del-en').addEventListener('click', () => deleteEnrollment(enr, () => { location.hash = `#/a/c/${d.course.id}/students`; }));
   $$('form[data-ff]').forEach((f) => bindForm(f, async (v) => { await POST(`/api/enrollments/${id}/assignments/${f.dataset.ff}/feedback`, { body: v.body }); toast('피드백을 남겼습니다.'); rerender(); }));
   $$('[data-fd]').forEach((b) => b.addEventListener('click', async () => {
     if (!(await confirmModal('피드백을 삭제할까요? 삭제 이력은 보존됩니다.', { okText: '삭제', danger: true }))) return;

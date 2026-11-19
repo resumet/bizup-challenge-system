@@ -14,6 +14,7 @@ delete process.env.SUPABASE_URL; // 테스트는 항상 로컬 파일 저장소 
 process.env.STAFF_SCRYPT_N = '1024';
 process.env.STUDENT_SCRYPT_N = '1024';
 process.env.LOGIN_MAX_FAILURES = '1000';
+process.env.ROSTER_API_ALLOW_PRIVATE = '1'; // 로컬 모의 API 서버 사용
 
 const { get, run, uuid, now, close, migrate } = require('../src/db');
 const { hashPassword } = require('../src/auth');
@@ -114,7 +115,7 @@ test('AT-07/08/09 명단 업로드: 미리보기 무생성, 재업로드 중복 
   assert.equal((await get('SELECT COUNT(*) AS n FROM enrollments WHERE course_id = ?', c.id)).n, 2);
 });
 
-test('AT-10/11/12/14 로그인 구분, 로그인 정보 조회 이력, 강사 명단 API 거부', async () => {
+test('AT-10/11/12/14 로그인 구분, 로그인 정보 조회 이력, 담당 외 강의 명단 접근 거부', async () => {
   const i = await mkInstructor('i3@t.com', '강사3');
   const c = await mkCourse('로그인', '1기', [i.id]);
   const r = await enroll(c.id, '정보', '01040000001');
@@ -128,8 +129,9 @@ test('AT-10/11/12/14 로그인 구분, 로그인 정보 조회 이력, 강사 �
   assert.ok((await get(`SELECT 1 AS ok FROM audit_logs WHERE action = 'LOGIN_INFO_REVEALED' AND actor_id = ?`, i.staffId)));
   ok(await admin.patch(`/api/enrollments/${r.enrollment_id}/status`, { status: 'INACTIVE', reason: '중도탈퇴' }));
   assert.equal((await i.client.post(`/api/enrollments/${r.enrollment_id}/login-info/reveal`)).status, 403);
-  assert.equal((await preview(i.client, c.id, 'a.csv', Buffer.from('이름,전화번호\n'))).status, 403);
-  assert.equal((await i.client.post(`/api/courses/${c.id}/enrollments`, { name: 'x', phone: '01040000009' })).status, 403);
+  const other = await mkCourse('로그인', '2기');
+  assert.equal((await preview(i.client, other.id, 'a.csv', Buffer.from('이름,전화번호\n'))).status, 404);
+  assert.equal((await i.client.post(`/api/courses/${other.id}/enrollments`, { name: 'x', phone: '01040000009' })).status, 404);
 });
 
 test('AT-13 전화번호 정정: ID 유지, 중복 거부, 세션 취소', async () => {
@@ -458,4 +460,112 @@ test('다른 계정 세션이 남은 브라우저에서 설정 링크 사용 후
   b2.csrf = '';
   const denied = await b2.post('/api/auth/logout');
   assert.equal(denied.status, 403); assert.equal(denied.data.error.code, 'CSRF');
+});
+
+test('강사 명단 관리: 담당 강의 개별 등록·엑셀 업로드·수정·삭제, 담당 외 거부', async () => {
+  const i = await mkInstructor('roster-i@t.com', '명단강사');
+  const mine = await mkCourse('명단', '1기', [i.id]); const theirs = await mkCourse('명단', '2기');
+  // 개별 등록 (강사 메모는 관리자 전용이라 저장하지 않음)
+  const e1 = ok(await i.client.post(`/api/courses/${mine.id}/enrollments`, { name: '강사등록', phone: '010-5100-0001', memo: '강사메모' }), 'manual');
+  assert.equal((await get('SELECT admin_memo FROM enrollments WHERE id = ?', e1.enrollment_id)).admin_memo, null);
+  assert.equal((await i.client.post(`/api/courses/${theirs.id}/enrollments`, { name: '남의강의', phone: '01051000002' })).status, 404);
+  assert.equal((await i.client.post(`/api/courses/${mine.id}/enrollments`, { student_id: e1.student.id })).status, 403);
+  // 다른 강의 학생과 이름 충돌 시 기존 정보는 노출하지 않음
+  await enroll(theirs.id, '비밀이름', '01051000009');
+  const conflict = await i.client.post(`/api/courses/${mine.id}/enrollments`, { name: '다른이름', phone: '01051000009' });
+  assert.equal(conflict.status, 409); assert.equal(conflict.data.error.existing, undefined); assert.doesNotMatch(conflict.data.error.message, /비밀이름/);
+  // 엑셀(CSV) 업로드 → 미리보기 → 확정
+  const job = ok(await preview(i.client, mine.id, 'roster.csv', Buffer.from('이름,전화번호,메모\n업로드1,010-5100-0011,x\n비밀아님,01051000009,\n')), 'preview');
+  assert.equal(job.committable, 1);
+  assert.doesNotMatch(JSON.stringify(job.rows), /비밀이름/);
+  let done = ok(await i.client.post(`/api/imports/${job.id}/commit`, { idempotency_key: job.id }));
+  while (done.state === 'COMMITTING') done = ok(await i.client.post(`/api/imports/${job.id}/commit`, {}));
+  assert.equal(done.state, 'COMMITTED'); assert.equal(done.result_counts.created, 1);
+  // 관리자가 만든 다른 강의 업로드 작업은 볼 수 없음
+  const adminJob = ok(await preview(admin, theirs.id, 'b.csv', Buffer.from('이름,전화번호\n관리자업로드,01051000021\n')));
+  assert.equal((await i.client.get(`/api/imports/${adminJob.id}`)).status, 404);
+  assert.equal((await i.client.post(`/api/imports/${adminJob.id}/commit`, {})).status, 404);
+  // 수정: 담당 강의에만 등록된 학생은 강사가 이름·번호를 고칠 수 있음 (사유 필수)
+  assert.equal((await i.client.patch(`/api/enrollments/${e1.enrollment_id}/student`, { phone: '01051000003' })).status, 400);
+  ok(await i.client.patch(`/api/enrollments/${e1.enrollment_id}/student`, { name: '강사수정', phone: '01051000003', reason: '오타' }), 'edit');
+  await student('강사수정', '01051000003'); // 바뀐 번호로 로그인 가능
+  // 다른 강사의 강의에도 등록된 학생은 수정 불가
+  await enroll(theirs.id, '강사수정', '01051000003');
+  assert.equal((await i.client.patch(`/api/enrollments/${e1.enrollment_id}/student`, { name: '또수정', reason: 'x' })).status, 403);
+  // 삭제: 기록이 없으면 삭제 (다른 등록이 없는 학생은 함께 삭제)
+  const e2 = ok(await i.client.post(`/api/courses/${mine.id}/enrollments`, { name: '삭제대상', phone: '01051000004' }));
+  const del = ok(await i.client.del(`/api/enrollments/${e2.enrollment_id}`));
+  assert.equal(del.student_deleted, true);
+  assert.equal(await get('SELECT id FROM students WHERE id = ?', e2.student.id), undefined);
+  // 다른 강의에도 등록된 학생은 이 강의 등록만 삭제
+  const del1 = ok(await i.client.del(`/api/enrollments/${e1.enrollment_id}`));
+  assert.equal(del1.student_deleted, false);
+  // 수행 기록이 있으면 삭제 대신 비활성화
+  const ch = await mkChallenge(mine.id); const a = await mkAssignment(ch.id);
+  const e3 = ok(await i.client.post(`/api/courses/${mine.id}/enrollments`, { name: '수행함', phone: '01051000005' }));
+  const sc = await student('수행함', '01051000005');
+  const detail = ok(await sc.get(`/api/me/assignments/${a.id}`));
+  ok(await check(sc, a, detail.items[0]));
+  const blocked = await i.client.del(`/api/enrollments/${e3.enrollment_id}`);
+  assert.equal(blocked.status, 409); assert.equal(blocked.data.error.reason, 'HAS_ACTIVITY');
+  ok(await i.client.patch(`/api/enrollments/${e3.enrollment_id}/status`, { status: 'INACTIVE', reason: '중도탈퇴' }));
+  ok(await i.client.patch(`/api/enrollments/${e3.enrollment_id}/status`, { status: 'ACTIVE', reason: '재활성화' }));
+  // 담당 외 강의 등록은 수정·삭제·상태 변경 모두 404
+  const foreign = await enroll(theirs.id, '남의학생', '01051000006');
+  assert.equal((await i.client.del(`/api/enrollments/${foreign.enrollment_id}`)).status, 404);
+  assert.equal((await i.client.patch(`/api/enrollments/${foreign.enrollment_id}/student`, { name: 'x', reason: 'x' })).status, 404);
+  assert.equal((await i.client.patch(`/api/enrollments/${foreign.enrollment_id}/status`, { status: 'INACTIVE', reason: 'x' })).status, 404);
+});
+
+test('외부 API 명단 가져오기 (관리자 전용): 연동 소스·연결 테스트·미리보기·확정', async () => {
+  const http = require('http');
+  let lastReq;
+  const api = http.createServer((req, res) => {
+    lastReq = { url: req.url, auth: req.headers.authorization };
+    if (req.headers.authorization !== 'Bearer secret-token') { res.writeHead(401); return res.end(); }
+    res.setHeader('content-type', 'application/json');
+    res.end(JSON.stringify({ data: { students: [
+      { profile: { name: 'API학생1' }, mobile: '010-5200-0001', note: '결제완료' },
+      { profile: { name: 'API학생2' }, mobile: 1052000002 }, // 숫자형 → 앞자리 0 유실 → 오류 행
+      { profile: { name: '' }, mobile: '01052000003' },
+    ] } }));
+  }).listen(0);
+  const apiBase = `http://127.0.0.1:${api.address().port}`;
+  try {
+    const i = await mkInstructor('api-i@t.com', 'API강사');
+    const c = await mkCourse('API연동', '1기', [i.id]);
+    const body = { name: '결제 시스템', url: `${apiBase}/students?course={course_code}&q={param}`, headers: [{ name: 'Authorization', value: 'Bearer secret-token' }],
+      items_path: 'data.students', name_field: 'profile.name', phone_field: 'mobile', memo_field: 'note' };
+    assert.equal((await i.client.post('/api/roster-sources', body)).status, 403);
+    const src = ok(await admin.post('/api/roster-sources', body), 'create source');
+    assert.deepEqual(src.header_names, ['Authorization']);
+    assert.doesNotMatch(JSON.stringify(ok(await admin.get('/api/roster-sources'))), /secret-token/);
+    // 값 없이 수정하면 기존 인증 헤더 유지
+    ok(await admin.patch(`/api/roster-sources/${src.id}`, { name: '결제 시스템(수정)', headers: [{ name: 'Authorization' }] }));
+    const t = ok(await admin.post(`/api/roster-sources/${src.id}/test`, { course_id: c.id, param: '봄 학기' }), 'test');
+    assert.equal(t.total, 3); assert.equal(t.valid, 1); assert.ok(t.keys.includes('mobile'));
+    assert.equal(lastReq.url, `/students?course=${c.code}&q=%EB%B4%84%20%ED%95%99%EA%B8%B0`);
+    assert.equal((await i.client.post(`/api/courses/${c.id}/imports/api`, { source_id: src.id })).status, 403);
+    const job = ok(await admin.post(`/api/courses/${c.id}/imports/api`, { source_id: src.id }), 'api import');
+    assert.equal(job.source_type, 'API'); assert.equal(job.committable, 1);
+    assert.deepEqual(job.rows.map((r) => r.classification), ['NEW', 'ERROR', 'ERROR']);
+    assert.equal((await admin.post(`/api/imports/${job.id}/remap`, { mapping: {} })).status, 400);
+    let done = ok(await admin.post(`/api/imports/${job.id}/commit`, { idempotency_key: job.id }));
+    while (done.state === 'COMMITTING') done = ok(await admin.post(`/api/imports/${job.id}/commit`, {}));
+    assert.equal(done.result_counts.created, 1);
+    const e = await get(`SELECT e.admin_memo, ev.reason FROM enrollments e JOIN enrollment_events ev ON ev.enrollment_id = e.id
+      JOIN students s ON s.id = e.student_id WHERE s.normalized_phone = '01052000001'`);
+    assert.equal(e.admin_memo, '결제완료'); assert.equal(e.reason, 'API');
+    // 같은 명단을 다시 가져오면 중복 등록 없음
+    const again = ok(await admin.post(`/api/courses/${c.id}/imports/api`, { source_id: src.id }));
+    assert.equal(again.committable, 0); assert.equal(again.rows[0].classification, 'ALREADY_ENROLLED');
+    // 인증 실패는 사용자용 메시지로
+    ok(await admin.patch(`/api/roster-sources/${src.id}`, { headers: [{ name: 'Authorization', value: 'Bearer wrong' }] }));
+    const bad = await admin.post(`/api/courses/${c.id}/imports/api`, { source_id: src.id });
+    assert.equal(bad.status, 400); assert.match(bad.data.error.message, /HTTP 401/);
+    // 사설망 주소 차단 규칙
+    const { isBlockedAddress } = require('../src/rosterApi');
+    for (const ip of ['127.0.0.1', '10.1.2.3', '192.168.0.1', '169.254.169.254', '::1', 'fd00::1', '::ffff:127.0.0.1']) assert.ok(isBlockedAddress(ip), ip);
+    for (const ip of ['8.8.8.8', '2606:4700::1111']) assert.ok(!isBlockedAddress(ip), ip);
+  } finally { api.close(); }
 });

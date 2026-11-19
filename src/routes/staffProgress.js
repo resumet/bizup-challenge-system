@@ -110,7 +110,7 @@ r.get('/enrollments/:id/detail', A.requireStaff, async (req, res) => {
     };
   }));
   res.json({
-    enrollment: { id: e.id, status: e.status, enrolled_at: e.enrolled_at, deactivated_at: e.deactivated_at, reason: req.user.isAdmin ? e.reason : undefined, admin_memo: req.user.isAdmin ? e.admin_memo : undefined },
+    enrollment: { id: e.id, status: e.status, enrolled_at: e.enrolled_at, deactivated_at: e.deactivated_at, reason: e.reason, admin_memo: req.user.isAdmin ? e.admin_memo : undefined },
     student: { id: s.id, code: s.code, name: s.name, status: s.status, phone: req.user.isAdmin ? U.formatPhone(s.normalized_phone) : U.maskPhone(s.normalized_phone) },
     can_reveal_login: req.user.isAdmin || (e.status === 'ACTIVE' && s.status === 'ACTIVE'),
     course: c, other_enrollments: others, tasks,
