@@ -438,3 +438,24 @@ test('다운로드 단기 URL(mode=json)도 같은 권한 검사를 거친다', 
   assert.equal(info.name, '보고서.pdf'); assert.ok(info.url);
   assert.equal((await s2.get(`/api/files/${f.id}/download?mode=json`)).status, 404);
 });
+
+test('다른 계정 세션이 남은 브라우저에서 설정 링크 사용 후 새 계정 로그인', async () => {
+  // 관리자로 로그인된 브라우저(보안 토큰 없음 = 화면이 로그아웃 상태로 바뀐 직후)에서 진행
+  const browser = C(); ok(await browser.staffLogin('admin@t.com', 'adminpass1'));
+  const adminCookie = browser.cookie;
+  const r = ok(await admin.post('/api/staff', { email: 'newbie@t.com', name: '새강사', roles: ['INSTRUCTOR'] }));
+  browser.csrf = '';
+  ok(await browser.post('/api/auth/staff/setup', { token: r.setup_path.split('/').pop(), password: 'password123' }), 'setup');
+  // 설정 후 이 브라우저의 기존(관리자) 세션은 종료된다
+  assert.equal(browser.cookie, '');
+  const stale = new (require('../scripts/client').Client)(base); stale.cookie = adminCookie;
+  assert.equal((await stale.get('/api/me')).data.user, null);
+  // 로그인 요청은 남은 세션의 보안 토큰을 요구하지 않고, 기존 세션을 교체한다
+  const b2 = C(); b2.cookie = adminCookie;
+  ok(await b2.staffLogin('newbie@t.com', 'password123'), 'login');
+  assert.equal((await b2.get('/api/me')).data.user.email, 'newbie@t.com');
+  // 세션이 있는 상태의 일반 변경 요청은 여전히 보안 토큰이 필요하다
+  b2.csrf = '';
+  const denied = await b2.post('/api/auth/logout');
+  assert.equal(denied.status, 403); assert.equal(denied.data.error.code, 'CSRF');
+});

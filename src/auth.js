@@ -1,7 +1,7 @@
 'use strict';
 const crypto = require('crypto');
 const { get, all, run, uuid, now } = require('./db');
-const { E, sha256, randomToken, serverNow } = require('./util');
+const { E, AppError, sha256, randomToken, serverNow } = require('./util');
 
 // 17장: 비밀번호 전용 해시 + 개별 salt (scrypt).
 // 운영자: OWASP 권장 N=2^17. 학생: 전화번호 파생 고정값이라 엔트로피 자체가 낮고(5.3 제약),
@@ -102,14 +102,22 @@ async function loadSession(req) {
   return { session: s, user };
 }
 
+const SESSION_FREE_PATHS = new Set(['/auth/student/login', '/auth/staff/login', '/auth/staff/setup']);
+// 로그인·계정 설정 시 이 브라우저의 기존 세션을 종료한다(다른 계정 세션이 섞여 남지 않도록).
+async function endCurrentSession(req, res, { keepCookie = false } = {}) {
+  if (req.session) await run('UPDATE sessions SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL', now(), req.session.id);
+  if (!keepCookie) res.clearCookie(COOKIE, { path: '/' }); // 로그인 시에는 새 세션 쿠키가 덮어쓴다
+}
 async function sessionMiddleware(req, res, next) {
   const r = await loadSession(req);
   req.session = r ? r.session : null;
   req.user = r ? r.user : null;
   // CSRF: 쿠키 기반 변경 요청은 세션별 토큰 헤더를 요구한다.
-  if (req.session && !['GET', 'HEAD', 'OPTIONS'].includes(req.method)) {
+  // 로그인·계정 설정은 기존 세션을 사용하지 않고 오히려 교체하므로 검사하지 않는다
+  // (설정 링크를 연 브라우저에 다른 계정의 세션이 남아 있어도 진행되도록).
+  if (req.session && !['GET', 'HEAD', 'OPTIONS'].includes(req.method) && !SESSION_FREE_PATHS.has(req.path)) {
     if (req.get('x-csrf-token') !== req.session.csrf_token) {
-      throw E.forbidden('보안 토큰이 유효하지 않습니다. 페이지를 새로고침해주세요.');
+      throw new AppError(403, 'CSRF', '보안 토큰이 유효하지 않습니다. 페이지를 새로고침해주세요.');
     }
   }
   next();
@@ -156,7 +164,7 @@ async function audit(req, { courseId = null, targetType, targetId = null, action
 }
 
 module.exports = {
-  hashPassword, verifyPassword, dummyHash, createSession, revokeSubjectSessions, sessionMiddleware,
+  hashPassword, verifyPassword, dummyHash, createSession, endCurrentSession, revokeSubjectSessions, sessionMiddleware,
   requireUser, requireStaff, requireAdmin, requireStudent, checkLoginRate, recordLoginFailure,
   clearLoginFailures, failureDelay, audit, COOKIE, SECURE_COOKIE,
 };

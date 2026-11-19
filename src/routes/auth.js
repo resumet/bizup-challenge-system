@@ -23,6 +23,7 @@ r.post('/student/login', async (req, res) => {
     throw new AppError(401, 'LOGIN_FAILED', STUDENT_FAIL);
   }
   await A.clearLoginFailures(keys);
+  await A.endCurrentSession(req, res, { keepCookie: true });
   await A.createSession(res, 'STUDENT', st.id, st.credential_version);
   res.json({ ok: true });
 });
@@ -41,6 +42,7 @@ r.post('/staff/login', async (req, res) => {
   }
   await A.clearLoginFailures(keys);
   await run('UPDATE staff_accounts SET last_login_at = ? WHERE id = ?', now(), a.id);
+  await A.endCurrentSession(req, res, { keepCookie: true });
   await A.createSession(res, 'STAFF', a.id, a.credential_version);
   res.json({ ok: true });
 });
@@ -80,6 +82,7 @@ r.post('/staff/setup', async (req, res) => {
     await A.revokeSubjectSessions('STAFF', a.id);
     await A.audit({ user: { type: 'STAFF', id: a.id, name: a.name } }, { targetType: 'STAFF', targetId: a.id, action: 'PASSWORD_SET' });
   });
+  await A.endCurrentSession(req, res); // 설정 후에는 새 비밀번호로 다시 로그인한다
   res.json({ ok: true });
 });
 r.post('/staff/password', A.requireStaff, async (req, res) => {

@@ -59,6 +59,13 @@ async function api(method, path, body, opts = {}) {
     location.hash = wasStaff ? '#/staff-login' : '#/login';
     throw new ApiError(401, data);
   }
+  // 다른 탭에서 로그인·로그아웃해 보안 토큰이 바뀐 경우: 최신 토큰을 받아 한 번만 다시 시도한다.
+  if (res.status === 403 && data && data.error && data.error.code === 'CSRF' && !opts.retried) {
+    const before = ME && ME.id;
+    await loadMe();
+    // 그사이 다른 계정으로 바뀌었다면 그 계정으로 실행하지 않는다
+    if (ME && ME.id === before) return api(method, path, body, { ...opts, retried: true });
+  }
   if (!res.ok) throw new ApiError(res.status, data);
   return data;
 }
