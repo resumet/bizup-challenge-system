@@ -413,7 +413,7 @@ async function courseChallenges(el, c) {
         <button class="btn sm primary" data-pub-ch="${ch.id}">챌린지 공개</button></div>` : ''}
       <div class="table-wrap mt"><table><thead><tr><th>과제</th><th>상태</th><th class="num">할 일</th><th>제출</th><th class="num">완료</th></tr></thead><tbody>
       ${ch.assignments.map((a) => `<tr class="click" data-href="#/a/as/${a.id}"><td>${esc(a.title)}${a.copied_from_id ? ' <span class="small muted">(복사본)</span>' : ''}</td>
-        <td>${a.visibility === 'DRAFT' ? '<span class="badge warn">초안</span>' : '<span class="badge ok">공개</span>'} ${a.locked_at ? '<span class="badge" title="완료 조건 동결">🔒 동결</span>' : ''}</td>
+        <td>${a.visibility === 'DRAFT' ? '<span class="badge warn">초안</span>' : '<span class="badge ok">공개</span>'} ${a.locked_at ? `<span class="badge" title="완료 조건 동결">${icon('lock')} 동결</span>` : ''}</td>
         <td class="num">${a.item_count}</td><td>${a.submission_required ? '필수' : '선택'}</td><td class="num">${a.completed}</td></tr>`).join('') || '<tr><td colspan="5" class="muted center">과제가 없습니다.</td></tr>'}
       </tbody></table></div></div>`).join('') || '<div class="card center muted">챌린지가 없습니다.</div>'}`;
   $$('tr[data-href]', el).forEach((tr) => tr.addEventListener('click', () => { location.hash = tr.dataset.href; }));
@@ -488,7 +488,7 @@ route('/a/as/:id', async ({ id }) => {
 function renderAssignmentEditor(a) {
   const L = a.locked;
   APP().innerHTML = `<div class="breadcrumb"><a href="#/a/c/${a.course.id}/challenges">${esc(a.course.title)} ${esc(a.course.cohort_label)}</a> › ${esc(a.challenge.title)} ${a.challenge.visibility === 'DRAFT' ? '<span class="badge warn">챌린지 초안</span>' : ''}</div>
-    <div class="row between"><h1>${esc(a.title)} ${a.visibility === 'DRAFT' ? '<span class="badge warn">초안</span>' : '<span class="badge ok">공개</span>'} ${L ? '<span class="badge">🔒 동결</span>' : ''}</h1>
+    <div class="row between"><h1>${esc(a.title)} ${a.visibility === 'DRAFT' ? '<span class="badge warn">초안</span>' : '<span class="badge ok">공개</span>'} ${L ? `<span class="badge">${icon('lock')} 동결</span>` : ''}</h1>
       <div class="row"><button class="btn" id="preview">학생 화면 미리보기</button><button class="btn" id="copy">복사</button>
       ${a.visibility === 'DRAFT' ? '<button class="btn primary" id="publish">공개</button>' : (a.has_history ? '' : '<button class="btn" id="unpublish">공개 취소</button>')}
       ${a.has_history ? '' : '<button class="btn danger" id="delete">삭제</button>'}</div></div>
@@ -534,7 +534,7 @@ function renderAssignmentEditor(a) {
     }
   });
   const drawRes = (list) => {
-    $('#res').innerHTML = list.map((r) => `<li>${r.type === 'LINK' ? `🔗 <a href="${esc(r.url)}" target="_blank" rel="noopener noreferrer">${esc(r.title)}</a>` : `📎 <a href="/api/files/${r.file_id}/download">${esc(r.title)}</a> <span class="small muted">${fmtSize(r.size)}</span>`}
+    $('#res').innerHTML = list.map((r) => `<li>${r.type === 'LINK' ? `${icon('link')} <a href="${esc(r.url)}" target="_blank" rel="noopener noreferrer">${esc(r.title)}</a>` : `${icon('file')} <a href="/api/files/${r.file_id}/download">${esc(r.title)}</a> <span class="small muted">${fmtSize(r.size)}</span>`}
       <span class="grow"></span><button class="btn sm" data-ren="${r.id}">이름 변경</button><button class="btn sm danger" data-rrm="${r.id}">삭제</button></li>`).join('') || '<li class="muted small">등록된 자료가 없습니다.</li>';
     $$('[data-rrm]').forEach((b) => b.addEventListener('click', async () => {
       if (!(await confirmModal('이 자료를 과제에서 제거할까요? (복사본 과제의 자료는 유지됩니다)', { okText: '제거', danger: true }))) return;
@@ -603,7 +603,7 @@ function renderAssignmentEditor(a) {
   $('#preview').addEventListener('click', () => {
     modal(`<h2>학생 화면 미리보기</h2><p class="small muted">${esc(a.challenge.title)} · ${esc(a.challenge.start_date)} ~ ${esc(a.challenge.end_date)}</p>
       <h3>${esc(a.title)}</h3>${a.description ? `<div class="pre card">${esc(a.description)}</div>` : ''}
-      ${a.resources.length ? `<div class="card"><strong>강사 자료</strong><ul class="list">${a.resources.map((r) => `<li>${r.type === 'LINK' ? '🔗' : '📎'} ${esc(r.title)}</li>`).join('')}</ul></div>` : ''}
+      ${a.resources.length ? `<div class="card"><strong>강사 자료</strong><ul class="list">${a.resources.map((r) => `<li>${icon(r.type === 'LINK' ? 'link' : 'file')} ${esc(r.title)}</li>`).join('')}</ul></div>` : ''}
       <div class="card"><strong>해야 할 일 (0/${a.items.length})</strong><ul class="checklist mt">${a.items.map((it) => `<li><input type="checkbox" disabled><label>${esc(it.title)}${it.description ? `<div class="hint">${esc(it.description)}</div>` : ''}</label></li>`).join('')}</ul></div>
       <div class="card"><strong>결과물 제출</strong> ${a.submission_required ? '<span class="badge warn">필수</span>' : '<span class="badge">선택</span>'}</div>
       <p class="small muted">저장된 내용 기준입니다.</p><div class="actions"><button class="btn" data-close>닫기</button></div>`, { wide: true });
@@ -627,9 +627,9 @@ async function courseProgress(el, c, q) {
     <div class="table-wrap"><table class="matrix"><thead><tr><th>학생</th><th class="num">완료</th>${d.assignments.map((a) => `<th class="as" title="${esc(a.challenge_title)}">${esc(a.title)}${a.submission_required ? ' *' : ''}</th>`).join('')}<th>피드백</th></tr></thead>
     <tbody>${d.rows.map((r) => `<tr class="click" data-href="#/a/e/${r.enrollment_id}"><td><strong>${esc(r.student.name)}</strong><div class="small muted">${esc(r.student.code)} · ${esc(r.student.phone)}${r.enrollment_status !== 'ACTIVE' ? ' · <span class="badge danger">비활성</span>' : ''}</div></td>
       <td class="num">${r.total ? `${r.completed}/${r.total}<div class="small muted">${pctText(r.rate)}</div>` : '—'}</td>
-      ${r.cells.map((x) => `<td class="cell">${statusBadge(x.status, false)}<div class="small muted">${x.checked}/${x.items}${x.subs ? ` · 📎${x.subs}` : ''}</div></td>`).join('')}
+      ${r.cells.map((x) => `<td class="cell">${statusBadge(x.status, false)}<div class="small muted">${x.checked}/${x.items}${x.subs ? ` · ${icon('file', '제출물')}${x.subs}` : ''}</div></td>`).join('')}
       <td>${r.unread_feedback ? `<span class="badge warn">미확인 ${r.unread_feedback}</span>` : ''}</td></tr>`).join('') || `<tr><td colspan="${d.assignments.length + 3}" class="center muted">표시할 학생이 없습니다.</td></tr>`}</tbody></table></div>
-    <p class="small muted">* 제출 필수 과제. 셀 숫자는 체크한 할 일/전체, 📎는 현재 제출물 수입니다.</p>`;
+    <p class="small muted">* 제출 필수 과제. 셀 숫자는 체크한 할 일/전체, 파일 아이콘 옆 숫자는 현재 제출물 수입니다.</p>`;
   el.appendChild(pagination(d.total, d.page, d.size, (p, s) => go({ page: p, size: s })));
   $('#flt').addEventListener('submit', (e) => { e.preventDefault(); go({ ...formData(e.target), page: 1 }); });
   $$('tr[data-href]', el).forEach((tr) => tr.addEventListener('click', () => { location.hash = tr.dataset.href; }));
@@ -656,7 +656,7 @@ route('/a/e/:id', async ({ id }) => {
       <div class="row between"><div><strong>${esc(t.title)}</strong> <span class="small muted">${esc(t.challenge_title)} · 제출 ${t.submission_required ? '필수' : '선택'}</span></div>${statusBadge(t.status)}</div>
       <div class="small muted">할 일 ${t.checked}/${t.item_count}${t.completed_at ? ` · 완료 ${fmtDT(t.completed_at)}${t.completion_timing === 'LATE' ? ' (기한 후)' : ''}` : ''}${t.started_at ? ` · 시작 ${fmtDT(t.started_at)}` : ''}</div>
       <div class="grid two mt">
-        <div><strong class="small">해야 할 일</strong><ul class="list small">${t.items.map((i) => `<li>${i.is_checked ? '☑' : '☐'} ${esc(i.title)}${i.checked_at ? ` <span class="muted">${fmtDT(i.checked_at)}</span>` : ''}</li>`).join('')}</ul></div>
+        <div><strong class="small">해야 할 일</strong><ul class="list small">${t.items.map((i) => `<li>${icon(i.is_checked ? 'checkbox' : 'box', i.is_checked ? '완료' : '미완료')} ${esc(i.title)}${i.checked_at ? ` <span class="muted">${fmtDT(i.checked_at)}</span>` : ''}</li>`).join('')}</ul></div>
         <div><strong class="small">제출물 (현재·이전 버전)</strong><ul class="list small">${t.submissions.map((s) => `<li style="display:block">${s.status === 'REMOVED' ? `<span class="badge">삭제됨 ${fmtDT(s.removed_at)}</span> ` : ''}
           ${s.versions.map((v) => `<div>${v.revision === s.current_revision && s.status === 'READY' ? '<span class="badge ok">현재</span>' : `<span class="badge">v${v.revision}</span>`}
             ${v.type === 'LINK' ? `<a href="${esc(v.url)}" target="_blank" rel="noopener noreferrer" style="word-break:break-all">${esc(v.url)}</a>` : `<a href="/api/files/${v.file_id}/download">${esc(v.original_name)}</a> ${fmtSize(v.size)}`}
