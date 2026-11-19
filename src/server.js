@@ -79,6 +79,8 @@ function createApp() {
     const f = await get('SELECT * FROM file_assets WHERE id = ?', req.params.id);
     if (!f || f.status === 'DELETED' || f.status === 'PENDING' || f.purpose === 'roster') throw E.notFound();
     if (!(await AC.canDownloadFile(req.user, f.id))) throw E.notFound();
+    // mode=json: 화면이 단기 URL을 받아 원래 파일명으로 저장한다 (권한 검사는 동일)
+    if (req.query.mode === 'json') return res.json({ url: await storage().downloadUrl(f), name: f.original_name, content_type: f.content_type });
     const inline = req.query.inline === '1' && /^image\/(png|jpeg|webp)$/.test(f.content_type);
     await storage().sendDownload(res, f, inline);
   });

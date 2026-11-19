@@ -426,3 +426,15 @@ test('정리 작업 엔드포인트는 CRON_SECRET 없이는 숨김, 검증 실�
   const prep = ok(await admin.post('/api/files/prepare', { name: 'x.pdf', size: 10 }));
   assert.equal((await admin.get(`/api/files/${prep.id}/download`)).status, 404);
 });
+
+test('다운로드 단기 URL(mode=json)도 같은 권한 검사를 거친다', async () => {
+  const c = await mkCourse('다운로드', '1기');
+  await enroll(c.id, '다운1', '01077770001'); await enroll(c.id, '다운2', '01077770002');
+  const ch = await mkChallenge(c.id); const a = await mkAssignment(ch.id);
+  const s1 = await student('다운1', '01077770001'); const s2 = await student('다운2', '01077770002');
+  const f = ok(await s1.uploadFile('보고서.pdf', Buffer.from('%PDF-1.4 x')));
+  ok(await s1.post(`/api/me/assignments/${a.id}/submissions`, { type: 'FILE', file_id: f.id }));
+  const info = ok(await s1.get(`/api/files/${f.id}/download?mode=json`));
+  assert.equal(info.name, '보고서.pdf'); assert.ok(info.url);
+  assert.equal((await s2.get(`/api/files/${f.id}/download?mode=json`)).status, 404);
+});

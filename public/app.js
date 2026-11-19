@@ -149,6 +149,25 @@ function pagination(total, page, size, onGo) {
   return div;
 }
 
+/* 파일 다운로드: 권한 확인된 단기 URL을 받아 원래 파일명으로 저장 (모든 /api/files/:id/download 링크에 적용) */
+document.addEventListener('click', async (e) => {
+  const a = e.target.closest('a[href^="/api/files/"][href$="/download"]');
+  if (!a || e.ctrlKey || e.metaKey || e.shiftKey) return;
+  e.preventDefault();
+  try {
+    const info = await GET(a.getAttribute('href') + '?mode=json');
+    const res = await fetch(info.url, { credentials: info.url.startsWith('/') ? 'same-origin' : 'omit' });
+    if (!res.ok) throw new Error();
+    const url = URL.createObjectURL(await res.blob());
+    const link = document.createElement('a');
+    link.href = url; link.download = info.name;
+    document.body.appendChild(link); link.click(); link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 10000);
+  } catch (err) {
+    toast(err instanceof ApiError ? errMsg(err) : '파일을 내려받지 못했습니다. 다시 시도해주세요.', true);
+  }
+});
+
 /* ===== 라우터 ===== */
 const routes = [];
 function route(pattern, handler, opts = {}) {

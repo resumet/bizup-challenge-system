@@ -31,6 +31,11 @@ function supabaseDriver() {
       return Buffer.from(await blob.arrayBuffer());
     },
     async remove(key) { await sb().remove([key]); },
+    // 화면용: 서명 URL만 발급(파일명은 브라우저가 원래 이름으로 저장). Supabase가 한글 파일명을
+    // Content-Disposition filename* 에 이중 인코딩하는 문제를 피하기 위함.
+    async downloadUrl(f) {
+      return check(await sb().createSignedUrl(f.object_key, DOWNLOAD_TTL)).signedUrl;
+    },
     async sendDownload(res, f, inline) {
       const d = check(await sb().createSignedUrl(f.object_key, DOWNLOAD_TTL, inline ? undefined : { download: f.original_name }));
       res.setHeader('Cache-Control', 'private, no-store');
@@ -56,6 +61,7 @@ function localDriver() {
   return {
     kind: 'local',
     async createUploadTarget(f) { return { type: 'local', url: `/api/files/${f.id}/upload` }; },
+    async downloadUrl(f) { return `/api/files/${f.id}/download`; },
     async write(key, buf) {
       fs.mkdirSync(path.dirname(p(key)), { recursive: true });
       fs.writeFileSync(p(key), buf);
