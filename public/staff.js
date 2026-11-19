@@ -10,7 +10,7 @@ route('/a/dashboard', async () => {
     <div class="grid cards">
       ${stat(`${d.courses.READY} / ${d.courses.ACTIVE} / ${d.courses.ENDED}`, '준비 중 / 진행 중 / 종료 강의')}
       ${stat(d.active_instructors, '활성 강사')}
-      ${stat(d.unique_students, `고유 수강생 (전체 ${d.total_students})`)}
+      ${stat(d.unique_students, `고유 수강생 (전화번호 기준 · 강의별 ${d.total_students}명)`)}
       ${stat(d.active_enrollments, '활성 수강 등록')}
       ${stat(d.running_challenges, '진행 중 챌린지')}
       ${stat(`${d.progress.completed} / ${d.progress.target}`, `완료 / 대상 과제 건수 (${pctText(d.progress.rate)})`)}
@@ -133,13 +133,13 @@ async function courseStudents(el, c, q) {
   const page = Number(q.page) || 1; const size = Number(q.size) || 50;
   const data = await GET(`/api/courses/${c.id}/enrollments` + qs({ q: q.q, status: q.status, page, size }));
   const go = (p) => { location.hash = `#/a/c/${c.id}/students` + qs({ ...q, ...p }); };
-  // 등록 방법: 관리자(개별·기존 학생 연결·엑셀·외부 API), 담당 강사(개별·엑셀)
+  // 등록 방법: 관리자(개별·엑셀·외부 API), 담당 강사(개별·엑셀). 학생은 강의마다 따로 생긴다.
   el.innerHTML = `<div class="row between mb">
       <form class="filters" id="flt" style="margin:0"><input type="search" name="q" placeholder="이름·학생번호${ME.isAdmin ? '·전화번호' : '·전화번호 4자리 이상'}" value="${esc(q.q || '')}">
       <select name="status"><option value="ACTIVE">활성 등록</option><option value="INACTIVE" ${q.status === 'INACTIVE' ? 'selected' : ''}>비활성 이력</option><option value="ALL" ${q.status === 'ALL' ? 'selected' : ''}>전체</option></select>
       <button class="btn" type="submit">검색</button></form>
       <div class="row"><a class="btn" href="/api/import-template.csv">양식 다운로드</a><button class="btn primary" id="upload">엑셀 업로드</button><button class="btn" id="add">개별 등록</button>
-      ${ME.isAdmin ? '<button class="btn" id="link">기존 학생 연결</button><button class="btn" id="api-import">외부 API 가져오기</button>' : ''}</div>
+      ${ME.isAdmin ? '<button class="btn" id="api-import">외부 API 가져오기</button>' : ''}</div>
     </div>
     <div class="table-wrap"><table><thead><tr><th>학생 번호</th><th>이름</th><th>전화번호</th><th>상태</th><th class="num">완료/공개 과제</th><th class="num">미확인 피드백</th><th></th></tr></thead>
     <tbody>${data.items.map((e) => `<tr class="click" data-href="#/a/e/${e.id}">
@@ -161,7 +161,7 @@ async function courseStudents(el, c, q) {
   $('#add').addEventListener('click', () => {
     const m = modal(`<h2>개별 등록</h2><p class="small muted">${courseName(c)}</p><form id="af">
       <div class="field"><label>이름 *</label><input type="text" name="name" required maxlength="50"></div>
-      <div class="field"><label>전화번호 *</label><input type="tel" name="phone" required placeholder="010-1234-5678"><div class="hint">같은 번호의 기존 학생이 있으면 해당 학생을 이 강의에 연결합니다. 학생은 이름과 전화번호로 로그인합니다.</div></div>
+      <div class="field"><label>전화번호 *</label><input type="tel" name="phone" required placeholder="010-1234-5678"><div class="hint">이 강의에만 등록되는 수강생입니다. 다른 강의에 같은 번호가 있어도 별개로 관리됩니다. 학생은 이름과 전화번호로 로그인합니다.</div></div>
       ${ME.isAdmin ? '<div class="field"><label>수강 등록 메모 (관리자 전용)</label><input type="text" name="memo" maxlength="1000"></div>' : ''}
       <p class="form-error small" style="color:var(--danger)"></p>
       <div class="actions"><button type="button" class="btn" data-close>취소</button><button class="btn primary" type="submit">등록</button></div></form>`);
@@ -187,18 +187,6 @@ async function courseStudents(el, c, q) {
     });
   });
   if (!ME.isAdmin) return;
-  $('#link').addEventListener('click', () => {
-    const m = modal(`<h2>기존 학생 연결</h2><form id="sf" class="row"><input class="grow" type="search" name="q" placeholder="이름·학생번호·전화번호" required><button class="btn" type="submit">검색</button></form><ul class="list mt" id="sr"></ul>
-      <div class="actions"><button class="btn" data-close>닫기</button></div>`, { wide: true });
-    $('#sf', m.el).addEventListener('submit', async (e) => {
-      e.preventDefault();
-      const r = await GET('/api/students' + qs({ q: e.target.q.value, size: 20 }));
-      $('#sr', m.el).innerHTML = r.items.map((s) => `<li class="row between"><span>${esc(s.code)} · <strong>${esc(s.name)}</strong> · ${esc(s.phone)} ${s.status !== 'ACTIVE' ? '<span class="badge danger">비활성</span>' : ''}</span><button class="btn sm" data-sid="${s.id}">이 강의에 연결</button></li>`).join('') || '<li class="muted">검색 결과가 없습니다.</li>';
-      $$('[data-sid]', m.el).forEach((b) => b.addEventListener('click', async () => {
-        try { await POST(`/api/courses/${c.id}/enrollments`, { student_id: b.dataset.sid }); toast('연결했습니다.'); m.close(); rerender(); } catch (ex) { toast(errMsg(ex), true); }
-      }));
-    });
-  });
   $('#api-import').addEventListener('click', async () => {
     const sources = (await GET('/api/roster-sources')).items.filter((s) => s.status === 'ACTIVE');
     if (!sources.length) {
@@ -223,7 +211,7 @@ function editEnrollmentStudent(e) {
     <div class="field"><label>이름 *</label><input type="text" name="name" value="${esc(e.student.name)}" required maxlength="50"></div>
     <div class="field"><label>새 전화번호</label><input type="tel" name="phone" placeholder="바꿀 때만 입력 (예: 010-1234-5678)"></div>
     <div class="field"><label>변경 사유 *</label><input type="text" name="reason" required maxlength="500" placeholder="예: 전화번호 오타"></div>
-    <p class="notice warn small">이름·전화번호는 학생의 로그인 정보입니다. 바꾸면 학생은 새 정보로 다시 로그인해야 하고, 이 학생이 수강하는 모든 강의에 반영됩니다.${ME.isAdmin ? '' : ' 다른 강사의 강의에도 등록된 학생은 관리자만 수정할 수 있습니다.'}</p>
+    <p class="notice warn small">이름·전화번호는 학생의 로그인 정보입니다. 바꾸면 학생은 새 정보로 다시 로그인해야 합니다. 이 강의의 수강생에게만 반영되고 다른 강의에는 영향이 없습니다.</p>
     <p class="form-error small" style="color:var(--danger)"></p>
     <div class="actions"><button type="button" class="btn" data-close>취소</button><button class="btn primary" type="submit">저장</button></div></form>`);
   bindForm($('#ef', m.el), async (d) => {
@@ -233,7 +221,7 @@ function editEnrollmentStudent(e) {
 }
 // 수강 등록 삭제: 수행 기록이 없을 때만. 기록이 있으면 비활성화를 안내한다.
 async function deleteEnrollment(e, onDeleted = rerender) {
-  if (!(await confirmModal(`${e.student.name} (${e.student.code}) 수강생의 이 강의 등록을 삭제할까요?\n잘못 등록한 경우에 사용합니다. 다른 강의 등록이 없으면 학생 정보도 함께 삭제되며 되돌릴 수 없습니다.`, { okText: '삭제', danger: true }))) return;
+  if (!(await confirmModal(`${e.student.name} (${e.student.code}) 수강생의 이 강의 등록을 삭제할까요?\n잘못 등록한 경우에 사용합니다. 학생 정보도 함께 삭제되며 되돌릴 수 없습니다.`, { okText: '삭제', danger: true }))) return;
   try {
     const r = await DEL(`/api/enrollments/${e.id}`);
     toast(r.student_deleted ? '등록과 학생 정보를 삭제했습니다.' : '이 강의 등록을 삭제했습니다.'); onDeleted();
@@ -265,7 +253,7 @@ async function toggleEnrollment(id, status) {
 
 /* 명단 업로드 미리보기·확정 */
 const CLS = {
-  NEW: ['신규 학생', 'ok'], EXISTING_NEW_ENROLLMENT: ['기존 학생·신규 등록', 'primary'], ALREADY_ENROLLED: ['이미 등록됨', ''],
+  NEW: ['신규 등록', 'ok'], EXISTING_NEW_ENROLLMENT: ['기존 학생·신규 등록', 'primary'], ALREADY_ENROLLED: ['이미 등록됨', ''],
   DUP_IN_FILE: ['파일 내 중복', ''], CONFLICT_IN_FILE: ['파일 내 충돌', 'danger'], NAME_CONFLICT: ['이름 충돌', 'danger'],
   NEEDS_REACTIVATION: ['재활성화 필요', 'warn'], STUDENT_INACTIVE: ['비활성 학생', 'warn'], ERROR: ['오류', 'danger'], EXCLUDED: ['제외됨', ''], PENDING: ['대기', ''],
 };
@@ -273,7 +261,7 @@ const RESULT = { CREATED: ['생성', 'ok'], LINKED: ['연결', 'primary'], SKIPP
 route('/a/import/:id', async ({ id }, q) => {
   const job = await GET('/api/imports/' + id);
   const filter = q.f || 'ALL';
-  const rows = job.rows.filter((r) => filter === 'ALL' || (filter === 'ISSUE' ? !['NEW', 'EXISTING_NEW_ENROLLMENT'].includes(r.classification) : r.classification === filter));
+  const rows = job.rows.filter((r) => filter === 'ALL' || (filter === 'ISSUE' ? r.classification !== 'NEW' : r.classification === filter));
   const committed = job.state === 'COMMITTED';
   const isApi = job.source_type === 'API';
   const label = isApi ? '외부 API 명단' : '명단 업로드';
@@ -292,7 +280,7 @@ route('/a/import/:id', async ({ id }, q) => {
     <div class="card"><div class="row between"><div class="row">${Object.entries(job.preview_counts).map(([k, v]) => `<a class="badge ${CLS[k][1]}" href="#/a/import/${id}?f=${k}">${CLS[k][0]} ${v}</a>`).join('')}
       <a class="badge" href="#/a/import/${id}?f=ISSUE">확인 필요만</a><a class="badge" href="#/a/import/${id}">전체</a></div>
       ${job.state === 'PREVIEW' ? `<button class="btn primary" id="commit" ${job.committable ? '' : 'disabled'}>${job.committable}건 등록 확정</button>` : ''}</div>
-      <p class="small muted">신규 학생·기존 학생 신규 등록 행만 등록됩니다. 충돌·오류 행은 수정하거나 제외하세요. 업로드 명단에서 빠진 학생은 자동 삭제·비활성화되지 않습니다.</p></div>
+      <p class="small muted">신규 등록 행만 등록됩니다. 이미 이 강의에 있는 번호·충돌·오류 행은 수정하거나 제외하세요. 다른 강의에 같은 번호가 있어도 이 강의의 새 수강생으로 등록됩니다. 업로드 명단에서 빠진 학생은 자동 삭제·비활성화되지 않습니다.</p></div>
     <div class="table-wrap mt"><table><thead><tr><th>행</th><th>이름</th><th>전화번호</th><th>메모</th><th>분류</th><th>사유</th>${committed ? '<th>결과</th>' : '<th></th>'}</tr></thead>
     <tbody>${rows.map((r) => `<tr><td>${r.row_number}</td><td>${esc(r.raw_name)}</td><td>${esc(r.phone || r.raw_phone)}</td><td class="small">${esc(r.memo || '')}</td>
       <td><span class="badge ${CLS[r.classification][1]}">${CLS[r.classification][0]}</span></td><td class="small">${esc(r.error || '')}</td>
@@ -322,7 +310,7 @@ route('/a/import/:id', async ({ id }, q) => {
       <div class="field"><label>이름</label><input type="text" name="name" value="${esc(r.raw_name)}"></div>
       <div class="field"><label>전화번호</label><input type="text" name="phone" value="${esc(r.raw_phone)}"></div>
       <div class="field"><label>메모</label><input type="text" name="memo" value="${esc(r.memo || '')}"></div>
-      <p class="small muted">기존 학생의 이름·전화번호는 명단 업로드로 덮어쓰지 않습니다. 기존 정보가 틀렸다면 수강생 목록의 수정 기능${ME.isAdmin ? '이나 전체 학생 관리' : ''}에서 정정하세요.</p>
+      <p class="small muted">이 강의에 이미 있는 수강생의 이름·전화번호는 명단 업로드로 덮어쓰지 않습니다. 기존 정보가 틀렸다면 수강생 목록의 수정 기능에서 정정하세요.</p>
       <p class="form-error small" style="color:var(--danger)"></p>
       <div class="actions"><button type="button" class="btn" data-close>취소</button><button class="btn primary" type="submit">다시 검사</button></div></form>`);
     bindForm($('#rf', m.el), async (d) => { await PATCH(`/api/imports/${id}/rows/${r.row_number}`, d); m.close(); rerender(); });
@@ -646,10 +634,12 @@ route('/a/e/:id', async ({ id }) => {
         <dt>등록일</dt><dd>${fmtDT(d.enrollment.enrolled_at)}</dd>${d.enrollment.deactivated_at ? `<dt>비활성화</dt><dd>${fmtDT(d.enrollment.deactivated_at)} ${esc(d.enrollment.reason || '')}</dd>` : ''}
         ${ME.isAdmin ? `<dt>등록 메모</dt><dd class="pre">${esc(d.enrollment.admin_memo || '-')}</dd>` : ''}</dl>
         <div class="row mt">${d.can_reveal_login ? '<button class="btn" id="reveal">로그인 정보 확인</button>' : '<span class="small muted">비활성 수강생의 로그인 정보는 확인할 수 없습니다.</span>'}
-        ${ME.isAdmin ? `<a class="btn" href="#/a/st/${d.student.id}">전체 학생 정보</a>` : ''}<button class="btn" id="edit-st">정보 수정</button>
+        ${ME.isAdmin ? `<a class="btn" href="#/a/st/${d.student.id}">같은 번호 수강 이력</a>` : ''}<button class="btn" id="edit-st">정보 수정</button>
         <button class="btn ${d.enrollment.status === 'ACTIVE' ? 'danger' : ''}" id="toggle">${d.enrollment.status === 'ACTIVE' ? '등록 비활성화' : '재활성화'}</button><button class="btn danger" id="del-en">등록 삭제</button></div>
         <p class="small muted" id="reveal-box"></p></div>
-      <div class="card"><h2>${ME.isAdmin ? '다른 수강 이력' : '내가 담당하는 다른 강의 수강 이력'}</h2><ul class="list">${d.other_enrollments.map((o) => `<li><a href="#/a/e/${o.id}">${esc(o.code)} ${esc(o.title)} ${esc(o.cohort_label)}</a> ${o.status === 'ACTIVE' ? '' : '<span class="badge danger">비활성</span>'}</li>`).join('') || '<li class="muted small">없음</li>'}</ul></div>
+      ${d.same_phone_enrollments ? `<div class="card"><h2>같은 전화번호 수강 이력 <span class="small muted">관리자 전용</span></h2>
+        <p class="small muted">강의마다 별개 수강생입니다. 전화번호가 같은 다른 강의의 수강생을 보여줍니다.</p>
+        <ul class="list">${d.same_phone_enrollments.map((o) => `<li><a class="grow" href="#/a/e/${o.id}">${esc(o.code)} ${esc(o.title)} ${esc(o.cohort_label)}</a> <span class="small muted">${esc(o.name)} · ${esc(o.student_code)}</span> ${o.status === 'ACTIVE' ? '<span class="badge ok">활성</span>' : '<span class="badge danger">비활성</span>'}</li>`).join('') || '<li class="muted small">없음</li>'}</ul></div>` : ''}
     </div>
     <h2 class="mt">과제별 수행</h2>
     ${d.tasks.map((t) => `<div class="card" id="t-${t.id}">
@@ -747,15 +737,18 @@ route('/a/staff', async (_p, q) => {
   }));
 }, { auth: 'ADMIN' });
 
-/* 전체 학생 관리 (관리자) */
+/* 전체 수강생 (관리자): 강의별 수강생을 한 목록에서 조회, 같은 전화번호의 수강 이력 확인 */
+const enrBadge = (st) => (st === 'ACTIVE' ? '<span class="badge ok">활성</span>' : st ? '<span class="badge danger">비활성</span>' : '<span class="badge">등록 없음</span>');
 route('/a/students', async (_p, q) => {
   const page = Number(q.page) || 1; const size = Number(q.size) || 50;
   const d = await GET('/api/students' + qs({ q: q.q, page, size }));
-  APP().innerHTML = `<h1>전체 학생 관리</h1><p class="small muted">전화번호 기준으로 학생 고유번호가 하나씩 부여됩니다. 강의 등록은 각 강의의 수강생 탭에서 진행합니다.</p>
+  APP().innerHTML = `<h1>전체 수강생</h1><p class="small muted">수강생은 강의마다 따로 관리됩니다. 같은 사람이 여러 강의를 들으면 강의별로 한 줄씩 보입니다. 전화번호로 검색하면 그 번호로 들은 강의를 모두 확인할 수 있습니다.</p>
     <form class="filters" id="flt"><input type="search" name="q" placeholder="이름·학생번호·전화번호" value="${esc(q.q || '')}"><button class="btn" type="submit">검색</button></form>
-    <div class="table-wrap"><table><thead><tr><th>학생 번호</th><th>이름</th><th>전화번호</th><th>상태</th><th class="num">활성/전체 수강</th><th>등록일</th></tr></thead>
+    <div class="table-wrap"><table><thead><tr><th>학생 번호</th><th>이름</th><th>전화번호</th><th>강의</th><th>수강 상태</th><th class="num">같은 번호 다른 강의</th><th>등록일</th></tr></thead>
     <tbody>${d.items.map((s) => `<tr class="click" data-href="#/a/st/${s.id}"><td>${esc(s.code)}</td><td>${esc(s.name)}</td><td>${esc(s.phone.replace(/^(\d{3})(\d{3,4})(\d{4})$/, '$1-$2-$3'))}</td>
-      <td>${s.status === 'ACTIVE' ? '<span class="badge ok">활성</span>' : '<span class="badge danger">비활성</span>'}</td><td class="num">${s.active_enrollments}/${s.total_enrollments}</td><td class="small">${fmtDT(s.created_at)}</td></tr>`).join('') || '<tr><td colspan="6" class="center muted">학생이 없습니다.</td></tr>'}</tbody></table></div>`;
+      <td>${s.course_id ? `${esc(s.course_code)} ${esc(s.course_title)} ${esc(s.cohort_label)}` : '-'}</td>
+      <td>${enrBadge(s.enrollment_status)}${s.status !== 'ACTIVE' ? ' <span class="badge danger">학생 비활성</span>' : ''}</td>
+      <td class="num">${s.same_phone_count ? `${s.same_phone_count}개` : ''}</td><td class="small">${fmtDT(s.enrolled_at || s.created_at)}</td></tr>`).join('') || '<tr><td colspan="7" class="center muted">수강생이 없습니다.</td></tr>'}</tbody></table></div>`;
   APP().appendChild(pagination(d.total, d.page, d.size, (p, s) => { location.hash = '#/a/students' + qs({ ...q, page: p, size: s }); }));
   $('#flt').addEventListener('submit', (e) => { e.preventDefault(); location.hash = '#/a/students' + qs(formData(e.target)); });
   $$('tr[data-href]').forEach((tr) => tr.addEventListener('click', () => { location.hash = tr.dataset.href; }));
@@ -763,21 +756,24 @@ route('/a/students', async (_p, q) => {
 
 route('/a/st/:id', async ({ id }) => {
   const s = await GET('/api/students/' + id);
-  APP().innerHTML = `<div class="breadcrumb"><a href="#/a/students">전체 학생</a> ›</div>
+  APP().innerHTML = `<div class="breadcrumb"><a href="#/a/students">전체 수강생</a> ›</div>
     <h1>${esc(s.name)} <span class="small muted">${esc(s.code)}</span> ${s.status === 'ACTIVE' ? '<span class="badge ok">활성</span>' : '<span class="badge danger">비활성</span>'}</h1>
+    <p class="small muted">${s.course_id ? `${esc(s.course_code)} ${esc(s.course_title)} ${esc(s.cohort_label)} 수강생` : '수강 등록 없음'}</p>
     <div class="grid two">
-      <div class="card"><h2>정보 정정</h2><p class="small muted">이름·전화번호 정정은 같은 학생 ID를 유지하며 모든 수강 강의에 반영됩니다. 로그인 정보가 바뀌면 기존 세션이 취소됩니다.</p>
+      <div class="card"><h2>정보 정정</h2><p class="small muted">이 강의의 수강생에게만 반영됩니다. 같은 전화번호의 다른 강의 수강생은 바뀌지 않습니다. 로그인 정보가 바뀌면 기존 세션이 취소됩니다.</p>
         <form id="cf"><div class="field"><label>이름 (로그인 아이디)</label><input type="text" name="name" value="${esc(s.name)}" required></div>
         <div class="field"><label>전화번호 (로그인 비밀번호)</label><input type="tel" name="phone" value="${esc(s.phone)}" required></div>
-        <div class="field"><label>학생 계정 상태</label><select name="status"><option value="ACTIVE">활성</option><option value="DISABLED" ${s.status === 'DISABLED' ? 'selected' : ''}>비활성 (모든 강의 접근 중단)</option></select></div>
+        <div class="field"><label>학생 계정 상태</label><select name="status"><option value="ACTIVE">활성</option><option value="DISABLED" ${s.status === 'DISABLED' ? 'selected' : ''}>비활성 (이 강의 접근 중단)</option></select></div>
         <div class="field"><label>변경 사유 *</label><input type="text" name="reason" maxlength="500" placeholder="예: 명단 입력 오류 정정"></div>
-        <p class="form-error small" style="color:var(--danger)"></p><button class="btn primary" type="submit">저장</button></form></div>
-      <div class="card"><h2>수강 이력</h2><ul class="list">${s.enrollments.map((e) => `<li><a class="grow" href="#/a/e/${e.id}">${esc(e.course_code)} ${esc(e.title)} ${esc(e.cohort_label)}</a>
-        ${e.status === 'ACTIVE' ? '<span class="badge ok">활성</span>' : `<span class="badge danger">비활성</span> <span class="small muted">${esc(e.reason || '')}</span>`}</li>`).join('') || '<li class="muted">없음</li>'}</ul></div>
+        <p class="form-error small" style="color:var(--danger)"></p><button class="btn primary" type="submit">저장</button></form>
+        ${s.enrollment_id ? `<p class="mt"><a class="btn" href="#/a/e/${s.enrollment_id}">강의 수행 기록 보기</a></p>` : ''}</div>
+      <div class="card"><h2>같은 전화번호 수강 이력</h2><p class="small muted">전화번호가 같은 다른 강의의 수강생입니다. 강의마다 별개 계정이며 기록은 공유되지 않습니다.</p>
+        <ul class="list">${s.same_phone.map((o) => `<li><a class="grow" href="${o.enrollment_id ? `#/a/e/${o.enrollment_id}` : `#/a/st/${o.id}`}">${o.course_id ? `${esc(o.course_code)} ${esc(o.course_title)} ${esc(o.cohort_label)}` : '수강 등록 없음'}</a>
+          <span class="small muted">${esc(o.name)} · ${esc(o.code)}</span> ${enrBadge(o.enrollment_status)}</li>`).join('') || '<li class="muted">없음</li>'}</ul></div>
     </div>`;
   bindForm($('#cf'), async (d) => {
     const pre = await PATCH('/api/students/' + id, { ...d, dry_run: true });
-    if (pre.login_changed && !(await confirmModal(`로그인 정보(이름·전화번호)가 변경됩니다. 영향받는 강의 ${pre.affected_courses}개에 모두 반영되며 기존 세션이 취소됩니다.`, { okText: '저장' }))) return;
+    if (pre.login_changed && !(await confirmModal('로그인 정보(이름·전화번호)가 변경됩니다. 이 강의의 수강생에게만 반영되며 기존 세션이 취소됩니다.', { okText: '저장' }))) return;
     await PATCH('/api/students/' + id, d); toast('저장되었습니다.'); rerender();
   });
 }, { auth: 'ADMIN' });

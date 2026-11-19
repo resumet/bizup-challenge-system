@@ -139,31 +139,39 @@ r.get('/instructors', A.requireAdmin, async (req, res) => {
   });
 });
 
-// ---------- 전체 학생 관리 (관리자) ----------
+// ---------- 전체 수강생 조회 (관리자) ----------
+// 학생은 강의마다 별개다. 관리자는 모든 강의의 수강생을 한 목록에서 보고,
+// 같은 전화번호를 가진 수강생이 어떤 강의를 들었는지 확인할 수 있다(저장된 연결이 아니라 전화번호로 조회).
+const STUDENT_ROW = `SELECT s.id, s.code, s.name, s.normalized_phone AS phone, s.status, s.created_at,
+    e.id AS enrollment_id, e.status AS enrollment_status, e.enrolled_at, e.deactivated_at, e.reason,
+    c.id AS course_id, c.code AS course_code, c.title AS course_title, c.cohort_label, c.state AS course_state
+  FROM students s LEFT JOIN enrollments e ON e.student_id = s.id LEFT JOIN courses c ON c.id = e.course_id`;
 r.get('/students', A.requireAdmin, async (req, res) => {
   const { page, size, offset } = U.pageParams(req.query);
   const q = U.normalizeName(req.query.q || '');
   const digits = q.replace(/\D/g, '');
-  const where = `(? = '' OR s.normalized_name ILIKE ? OR s.code ILIKE ? OR (? != '' AND s.normalized_phone LIKE ?))`;
+  const conds = [`(? = '' OR s.normalized_name ILIKE ? OR s.code ILIKE ? OR (? != '' AND s.normalized_phone LIKE ?))`];
   const params = [q, `%${q}%`, `%${q}%`, digits, `%${digits}%`];
+  if (req.query.course_id) { conds.push('s.course_id = ?'); params.push(String(req.query.course_id)); }
+  const where = conds.join(' AND ');
   const total = (await get(`SELECT COUNT(*) AS n FROM students s WHERE ${where}`, ...params)).n;
-  const items = await all(`SELECT s.id, s.code, s.name, s.normalized_phone AS phone, s.status, s.created_at,
-      (SELECT COUNT(*) FROM enrollments e WHERE e.student_id = s.id AND e.status = 'ACTIVE') AS active_enrollments,
-      (SELECT COUNT(*) FROM enrollments e WHERE e.student_id = s.id) AS total_enrollments
-    FROM students s WHERE ${where} ORDER BY s.created_at DESC LIMIT ? OFFSET ?`, ...params, size, offset);
-  res.json({ items, total, page, size });
+  const items = await all(`${STUDENT_ROW} WHERE ${where} ORDER BY s.normalized_phone, s.created_at DESC LIMIT ? OFFSET ?`, ...params, size, offset);
+  // 같은 전화번호의 다른 강의 수강생 수 (관리자 전용 정보)
+  const phones = [...new Set(items.map((x) => x.phone))];
+  const counts = phones.length ? new Map((await all(`SELECT normalized_phone AS phone, COUNT(*) AS n FROM students WHERE normalized_phone = ANY(?::text[]) GROUP BY normalized_phone`, phones))
+    .map((x) => [x.phone, x.n])) : new Map();
+  res.json({ items: items.map((x) => ({ ...x, same_phone_count: (counts.get(x.phone) || 1) - 1 })), total, page, size });
 });
 
 r.get('/students/:id', A.requireAdmin, async (req, res) => {
-  const s = await get('SELECT id, code, name, normalized_phone AS phone, status, created_at, updated_at FROM students WHERE id = ?', req.params.id);
+  const s = await get(`${STUDENT_ROW} WHERE s.id = ?`, req.params.id);
   if (!s) throw E.notFound();
-  s.enrollments = await all(`SELECT e.id, e.status, e.enrolled_at, e.deactivated_at, e.reason, e.admin_memo,
-      c.id AS course_id, c.code AS course_code, c.title, c.cohort_label, c.state
-    FROM enrollments e JOIN courses c ON c.id = e.course_id WHERE e.student_id = ? ORDER BY e.enrolled_at DESC`, s.id);
+  s.updated_at = (await get('SELECT updated_at FROM students WHERE id = ?', s.id)).updated_at;
+  s.same_phone = await all(`${STUDENT_ROW} WHERE s.normalized_phone = ? AND s.id != ? ORDER BY e.enrolled_at DESC`, s.phone, s.id);
   res.json(s);
 });
 
-// 7.4 이름·전화번호 정정 (관리자만, 같은 학생 ID 유지, 충돌 시 거부, 세션 취소)
+// 7.4 이름·전화번호 정정 (관리자만, 같은 학생 ID 유지, 같은 강의 안 충돌 시 거부, 세션 취소). 이 강의의 학생에게만 반영된다.
 r.patch('/students/:id', A.requireAdmin, async (req, res) => {
   const s = await get('SELECT * FROM students WHERE id = ?', req.params.id);
   if (!s) throw E.notFound();
@@ -182,7 +190,8 @@ r.get('/admin/dashboard', A.requireAdmin, async (req, res) => {
   res.json({
     courses: { READY: states.READY || 0, ACTIVE: states.ACTIVE || 0, ENDED: states.ENDED || 0, ARCHIVED: states.ARCHIVED || 0 },
     active_instructors: await n(`SELECT COUNT(*) AS n FROM staff_accounts a JOIN staff_roles r ON r.staff_id = a.id AND r.role = 'INSTRUCTOR' WHERE a.status = 'ACTIVE'`),
-    unique_students: await n(`SELECT COUNT(DISTINCT e.student_id) AS n FROM enrollments e JOIN students s ON s.id = e.student_id WHERE e.status = 'ACTIVE' AND s.status = 'ACTIVE'`),
+    // 학생은 강의마다 별개이므로 고유 인원은 전화번호 기준으로 센다
+    unique_students: await n(`SELECT COUNT(DISTINCT s.normalized_phone) AS n FROM enrollments e JOIN students s ON s.id = e.student_id WHERE e.status = 'ACTIVE' AND s.status = 'ACTIVE'`),
     total_students: await n('SELECT COUNT(*) AS n FROM students'),
     active_enrollments: await n(`SELECT COUNT(*) AS n FROM enrollments e JOIN students s ON s.id = e.student_id WHERE e.status = 'ACTIVE' AND s.status = 'ACTIVE'`),
     running_challenges: await n(`SELECT COUNT(*) AS n FROM challenges WHERE visibility = 'PUBLISHED' AND starts_at <= ? AND deadline_at > ?`, t, t),

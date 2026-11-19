@@ -145,7 +145,8 @@ r.delete('/courses/:id/instructors/:iid', A.requireAdmin, async (req, res) => {
 });
 
 // ---------- 수강생 명단 ----------
-// 등록 경로: (1) 관리자 — 개별 등록·기존 학생 연결·엑셀 업로드·외부 API 가져오기
+// 학생은 강의마다 따로 둔다(전체 시스템 공유 없음). 같은 사람이 두 강의를 들으면 강의별 학생이 각각 생긴다.
+// 등록 경로: (1) 관리자 — 개별 등록·엑셀 업로드·외부 API 가져오기
 //            (2) 담당 강사 — 자신이 배정된 강의에 한해 엑셀 업로드·개별 등록·수정·삭제(비활성화)
 function enrollmentRow(e, user) {
   return {
@@ -184,10 +185,10 @@ r.get('/courses/:id/enrollments', A.requireStaff, async (req, res) => {
   });
 });
 
-async function createStudent(name, phone, hash) {
+async function createStudent(courseId, name, phone, hash) {
   const id = uuid(); const t = now();
-  await run(`INSERT INTO students(id, code, name, normalized_name, normalized_phone, status, created_at, updated_at) VALUES(?,?,?,?,?,'ACTIVE',?,?)`,
-    id, await nextCode('STU'), name, name, phone, t, t);
+  await run(`INSERT INTO students(id, code, name, normalized_name, normalized_phone, status, course_id, created_at, updated_at) VALUES(?,?,?,?,?,'ACTIVE',?,?,?)`,
+    id, await nextCode('STU'), name, name, phone, courseId, t, t);
   await run('INSERT INTO student_credentials(student_id, password_hash) VALUES(?,?)', id, hash);
   return get('SELECT * FROM students WHERE id = ?', id);
 }
@@ -199,44 +200,34 @@ async function createEnrollment(req, courseId, studentId, memo, source) {
   return id;
 }
 
-// 7.4 개별 등록 (관리자·담당 강사). 기존 학생 ID로 연결(student_id)은 전체 학생을 검색할 수 있는 관리자만.
+// 7.4 개별 등록 (관리자·담당 강사). 같은 전화번호 중복은 이 강의 안에서만 확인한다.
 r.post('/courses/:id/enrollments', A.requireStaff, async (req, res) => {
   const c = await AC.loadCourseForStaff(req.user, req.params.id);
   // 등록 메모는 관리자 전용 필드이므로 강사 입력은 저장하지 않는다
   const memo = req.user.isAdmin ? U.str(req.body.memo, 1000) : null;
-  const studentId = req.body.student_id || null;
-  if (studentId && !req.user.isAdmin) throw E.forbidden();
-  let name; let phone; let hash = null;
-  if (!studentId) {
-    name = U.normalizeName(U.str(req.body.name, 50));
-    if (!name) throw E.invalid('이름을 입력해주세요.');
-    phone = U.normalizePhone(req.body.phone);
-    if (!phone) throw E.invalid(U.phoneError(req.body.phone));
-    if (!(await get('SELECT 1 AS ok FROM students WHERE normalized_phone = ?', phone))) hash = await A.hashPassword(phone, 'STUDENT');
-  }
+  if (req.body.student_id) throw E.invalid('학생은 강의마다 따로 등록합니다. 이름과 전화번호로 등록해주세요.');
+  const name = U.normalizeName(U.str(req.body.name, 50));
+  if (!name) throw E.invalid('이름을 입력해주세요.');
+  const phone = U.normalizePhone(req.body.phone);
+  if (!phone) throw E.invalid(U.phoneError(req.body.phone));
+  const inCourse = 'SELECT * FROM students WHERE course_id = ? AND normalized_phone = ?';
+  const hash = (await get(inCourse, c.id, phone)) ? null : await A.hashPassword(phone, 'STUDENT');
   const out = await tx(async () => {
-    let s;
-    if (studentId) {
-      s = await get('SELECT * FROM students WHERE id = ?', studentId);
-      if (!s) throw E.notFound();
-    } else {
-      s = await get('SELECT * FROM students WHERE normalized_phone = ?', phone);
-      // 강사에게는 다른 강의 학생의 정보(이름·번호)를 보여주지 않는다
-      if (s && s.normalized_name !== name) {
-        throw E.conflict('같은 전화번호로 다른 이름의 수강생이 이미 있습니다. 이름과 번호를 확인해주세요.' + (req.user.isAdmin ? '' : ' 계속 문제가 있으면 관리자에게 문의해주세요.'),
-          { reason: 'NAME_CONFLICT', existing: req.user.isAdmin ? { code: s.code, name: s.name } : undefined });
-      }
-    }
-    if (s && s.status !== 'ACTIVE') throw E.conflict('비활성화된 수강생입니다. 관리자가 전체 학생 관리에서 검토 후 활성화해야 합니다.', { reason: 'STUDENT_INACTIVE' });
+    let s = await get(inCourse + ' FOR UPDATE', c.id, phone);
     if (s) {
+      if (s.normalized_name !== name) {
+        throw E.conflict('이 강의에 같은 전화번호로 다른 이름의 수강생이 이미 있습니다. 이름과 번호를 확인해주세요.',
+          { reason: 'NAME_CONFLICT', existing: { code: s.code, name: s.name } });
+      }
+      if (s.status !== 'ACTIVE') throw E.conflict('비활성화된 수강생입니다. 관리자가 전체 학생 관리에서 검토 후 활성화해야 합니다.', { reason: 'STUDENT_INACTIVE' });
       const ex = await get('SELECT * FROM enrollments WHERE course_id = ? AND student_id = ?', c.id, s.id);
       if (ex && ex.status === 'ACTIVE') throw E.conflict('이미 등록된 수강생입니다. 기존 기록을 유지합니다.', { reason: 'ALREADY_ENROLLED' });
       if (ex) throw E.conflict('비활성화된 수강 등록이 있습니다. 재활성화가 필요합니다.', { reason: 'NEEDS_REACTIVATION', enrollment_id: ex.id });
-    } else {
-      if (!hash) throw E.conflict('잠시 후 다시 시도해주세요.');
-      s = await createStudent(name, phone, hash);
-      await A.audit(req, { courseId: c.id, targetType: 'STUDENT', targetId: s.id, action: 'STUDENT_CREATED', changed: { code: s.code } });
+      throw E.conflict('수강 등록이 없는 학생 정보가 남아 있습니다. 관리자에게 문의해주세요.', { reason: 'ORPHAN_STUDENT' });
     }
+    if (!hash) throw E.conflict('잠시 후 다시 시도해주세요.');
+    s = await createStudent(c.id, name, phone, hash);
+    await A.audit(req, { courseId: c.id, targetType: 'STUDENT', targetId: s.id, action: 'STUDENT_CREATED', changed: { code: s.code } });
     const eid = await createEnrollment(req, c.id, s.id, memo, 'MANUAL');
     return { enrollment_id: eid, student: { id: s.id, code: s.code, name: s.name } };
   });
@@ -273,19 +264,10 @@ r.patch('/enrollments/:id', A.requireAdmin, async (req, res) => {
   res.json({ ok: true });
 });
 
-// 수강생 이름·전화번호 수정 (관리자·담당 강사)
-// 학생 정보는 모든 강의에서 공유되므로, 강사는 그 학생이 자신이 담당하는 강의에만 등록된 경우에만 수정할 수 있다.
-async function otherCourseEnrollments(user, studentId) {
-  if (user.isAdmin) return 0;
-  return (await get(`SELECT COUNT(*) AS n FROM enrollments e WHERE e.student_id = ? AND NOT EXISTS (
-      SELECT 1 FROM course_instructors ci WHERE ci.course_id = e.course_id AND ci.instructor_id = ? AND ci.status = 'ACTIVE')`, studentId, user.instructorId)).n;
-}
+// 수강생 이름·전화번호 수정 (관리자·담당 강사). 학생은 이 강의에만 속하므로 다른 강의에는 영향이 없다.
 r.patch('/enrollments/:id/student', A.requireStaff, async (req, res) => {
   const e = await AC.loadEnrollmentForStaff(req.user, req.params.id);
   const s = await get('SELECT * FROM students WHERE id = ?', e.student_id);
-  if (await otherCourseEnrollments(req.user, s.id)) {
-    throw E.forbidden('다른 강사의 강의에도 등록된 수강생이라 정보를 수정할 수 없습니다. 관리자에게 정정을 요청해주세요.');
-  }
   res.json(await correctStudent(req, s, req.body, { allowStatus: req.user.isAdmin, courseId: e.course_id }));
 });
 
@@ -310,7 +292,7 @@ r.delete('/enrollments/:id', A.requireStaff, async (req, res) => {
     await run('DELETE FROM enrollment_events WHERE enrollment_id = ?', e.id);
     await run('UPDATE import_rows SET enrollment_id_optional = NULL WHERE enrollment_id_optional = ?', e.id);
     await run('DELETE FROM enrollments WHERE id = ?', e.id);
-    // 다른 수강 등록이 없는 학생은 함께 삭제해 잘못 입력된 이름·번호가 남지 않게 한다
+    // 학생은 이 강의에만 속하므로 함께 삭제해 잘못 입력된 이름·번호가 남지 않게 한다
     let studentDeleted = false;
     const rest = (await get('SELECT COUNT(*) AS n FROM enrollments WHERE student_id = ?', s.id)).n;
     const reads = (await get('SELECT COUNT(*) AS n FROM feedback_reads WHERE student_id = ?', s.id)).n;
@@ -374,9 +356,9 @@ function guessMapping(headers) {
   return { name: find(/^(이름|성명|수강생명|name)$/i) ?? find(/이름|성명/), phone: find(/전화|휴대폰|핸드폰|연락처|phone|mobile/i), memo: find(/메모|memo|비고/i) };
 }
 
-// 행 분류: 학생·등록 조회를 한 번에 수행하고 결과를 일괄 갱신한다 (대량 명단에서도 왕복 횟수 일정).
-// detail=false(강사)이면 다른 강의 학생의 이름·번호를 사유에 넣지 않는다.
-async function classifyJob(job, detail) {
+// 행 분류: 이 강의의 학생·등록만 조회해 한 번에 분류하고 결과를 일괄 갱신한다 (대량 명단에서도 왕복 횟수 일정).
+// 다른 강의에 같은 전화번호가 있어도 별개 학생이므로 신규로 분류한다.
+async function classifyJob(job) {
   const rows = await all('SELECT * FROM import_rows WHERE import_job_id = ? ORDER BY row_number', job.id);
   const prepared = rows.map((row) => {
     const name = U.normalizeName(row.raw_name);
@@ -396,7 +378,7 @@ async function classifyJob(job, detail) {
     else list.slice(1).forEach((p) => { p.cls = 'DUP_IN_FILE'; p.error = `명단 안 중복 행입니다. (${list[0].row.row_number}행만 처리)`; });
   }
   const phones = prepared.filter((p) => !p.cls).map((p) => p.phone);
-  const students = phones.length ? await all('SELECT * FROM students WHERE normalized_phone = ANY(?::text[])', phones) : [];
+  const students = phones.length ? await all('SELECT * FROM students WHERE course_id = ? AND normalized_phone = ANY(?::text[])', job.course_id, phones) : [];
   const sByPhone = new Map(students.map((s) => [s.normalized_phone, s]));
   const enrs = students.length ? await all('SELECT * FROM enrollments WHERE course_id = ? AND student_id = ANY(?::text[])', job.course_id, students.map((s) => s.id)) : [];
   const eByStudent = new Map(enrs.map((e) => [e.student_id, e]));
@@ -406,13 +388,13 @@ async function classifyJob(job, detail) {
     if (!s) { p.cls = 'NEW'; continue; }
     if (s.normalized_name !== p.name) {
       p.cls = 'NAME_CONFLICT';
-      p.error = detail ? `기존 수강생 정보와 이름이 다릅니다. 확인 후 등록해주세요. (기존: ${s.name}, ${s.code})` : '같은 전화번호로 다른 이름의 수강생이 이미 있습니다. 이름과 번호를 확인해주세요.';
+      p.error = `이 강의의 기존 수강생과 이름이 다릅니다. 확인 후 등록해주세요. (기존: ${s.name}, ${s.code})`;
       continue;
     }
     if (s.status !== 'ACTIVE') { p.cls = 'STUDENT_INACTIVE'; p.error = '비활성화된 수강생입니다. 관리자 검토가 필요합니다.'; continue; }
     const e = eByStudent.get(s.id);
     p.student_id = s.id;
-    if (!e) { p.cls = 'EXISTING_NEW_ENROLLMENT'; continue; }
+    if (!e) { p.cls = 'ERROR'; p.error = '수강 등록이 없는 학생 정보가 남아 있습니다. 관리자에게 문의해주세요.'; continue; }
     p.enrollment_id = e.id;
     if (e.status === 'ACTIVE') { p.cls = 'ALREADY_ENROLLED'; p.error = '이미 등록된 수강생입니다. 기존 기록을 유지합니다.'; } else { p.cls = 'NEEDS_REACTIVATION'; p.error = '비활성화된 수강 등록입니다. 재활성화가 필요합니다.'; }
   }
@@ -425,7 +407,7 @@ async function classifyJob(job, detail) {
   col((p) => p.row.row_number), col((p) => p.name), col((p) => p.phone), col((p) => p.cls), col((p) => p.error),
   col((p) => p.student_id), col((p) => p.enrollment_id), job.id);
 }
-const COMMITTABLE = ['NEW', 'EXISTING_NEW_ENROLLMENT'];
+const COMMITTABLE = ['NEW'];
 async function jobView(jobId) {
   const j = await get('SELECT j.*, c.code AS course_code, c.title AS course_title, c.cohort_label FROM import_jobs j JOIN courses c ON c.id = j.course_id WHERE j.id = ?', jobId);
   const rows = (await all('SELECT * FROM import_rows WHERE import_job_id = ? ORDER BY row_number', jobId)).map((x) => ({
@@ -457,7 +439,7 @@ async function insertRows(job, rows) {
     rows.map((x) => (x.memo ? String(x.memo).slice(0, 1000) : null)));
   }
 }
-async function loadRowsFromWorkbook(job, wb, sheet, mappingIn, detail) {
+async function loadRowsFromWorkbook(job, wb, sheet, mappingIn) {
   const data = sheetRows(wb, sheet);
   const headers = (data[0] || []).map((h) => String(h).trim());
   const mapping = mappingIn && mappingIn.name != null && mappingIn.phone != null ? mappingIn : guessMapping(headers);
@@ -467,7 +449,7 @@ async function loadRowsFromWorkbook(job, wb, sheet, mappingIn, detail) {
   if (mapping.name == null || mapping.phone == null) { await insertRows(job, []); return; } // 열 매핑 필요
   const cell = (row, i) => (i == null || i === '' ? '' : String(row[Number(i)] ?? '').trim());
   await insertRows(job, body.map((row, i) => ({ rn: i + 2, name: cell(row, mapping.name), phone: cell(row, mapping.phone), memo: cell(row, mapping.memo) || null })));
-  await classifyJob(job, detail);
+  await classifyJob(job);
 }
 // 업로드 작업 접근: 관리자 또는 해당 강의의 담당 강사
 async function loadJob(user, id, lock) {
@@ -499,7 +481,7 @@ r.post('/courses/:id/imports/preview', A.requireStaff, async (req, res) => {
     const job = await newJob(req, c, { file_id: f.id, file_hash: crypto.createHash('sha256').update(buf).digest('hex'), original_name: f.original_name, sheet_names: wb.SheetNames, source_type: 'FILE' });
     let mapping = null;
     if (req.body.name_col != null && req.body.phone_col != null) mapping = { name: req.body.name_col, phone: req.body.phone_col, memo: req.body.memo_col ?? null };
-    await loadRowsFromWorkbook(job, wb, req.body.sheet && wb.SheetNames.includes(req.body.sheet) ? req.body.sheet : wb.SheetNames[0], mapping, req.user.isAdmin);
+    await loadRowsFromWorkbook(job, wb, req.body.sheet && wb.SheetNames.includes(req.body.sheet) ? req.body.sheet : wb.SheetNames[0], mapping);
     return job.id;
   });
   res.status(201).json(await jobView(out));
@@ -519,7 +501,7 @@ r.post('/courses/:id/imports/api', A.requireAdmin, async (req, res) => {
       headers: [src.name_field, src.phone_field, src.memo_field].filter(Boolean), mapping: { name: src.name_field, phone: src.phone_field, memo: src.memo_field || null },
     });
     await insertRows(job, data.items.map((x, i) => ({ rn: i + 1, ...x })));
-    await classifyJob(job, true);
+    await classifyJob(job);
     await run('UPDATE roster_sources SET last_used_at = ? WHERE id = ?', now(), src.id);
     await A.audit(req, { courseId: c.id, targetType: 'IMPORT', targetId: job.id, action: 'ROSTER_API_FETCHED', changed: { source: src.name, rows: data.items.length, param: param || undefined } });
     return job.id;
@@ -536,7 +518,7 @@ r.post('/imports/:id/remap', A.requireStaff, async (req, res) => {
     if (job.state !== 'PREVIEW') throw E.conflict('이미 확정된 업로드입니다.');
     const m = req.body.mapping || {};
     const toIdx = (v) => (v === null || v === undefined || v === '' ? null : Number(v));
-    await loadRowsFromWorkbook(job, wb, req.body.sheet || job.sheet_name, { name: toIdx(m.name), phone: toIdx(m.phone), memo: toIdx(m.memo) }, req.user.isAdmin);
+    await loadRowsFromWorkbook(job, wb, req.body.sheet || job.sheet_name, { name: toIdx(m.name), phone: toIdx(m.phone), memo: toIdx(m.memo) });
   });
   res.json(await jobView(req.params.id));
 });
@@ -552,7 +534,7 @@ r.patch('/imports/:id/rows/:n', A.requireStaff, async (req, res) => {
       req.body.phone !== undefined ? U.str(req.body.phone, 40) : row.raw_phone,
       req.body.memo !== undefined ? U.str(req.body.memo, 1000) : row.memo,
       req.body.excluded !== undefined ? (req.body.excluded ? 1 : 0) : row.excluded, job.id, row.row_number);
-    await classifyJob(job, req.user.isAdmin);
+    await classifyJob(job);
   });
   res.json(await jobView(req.params.id));
 });
@@ -573,11 +555,11 @@ r.post('/imports/:id/commit', A.requireStaff, async (req, res) => {
   const job = await tx(async () => {
     const j = await loadJob(req.user, req.params.id, true);
     if (j.state !== 'PREVIEW') return j; // 이미 확정 중/완료면 그대로 진행
-    await classifyJob(j, req.user.isAdmin);
+    await classifyJob(j);
     // 등록 대상이 아닌 행은 즉시 결과를 기록
     await run(`UPDATE import_rows SET result = CASE WHEN classification IN ('ALREADY_ENROLLED','DUP_IN_FILE','EXCLUDED') THEN 'SKIPPED' ELSE 'FAILED' END,
         result_message = COALESCE(error, CASE WHEN classification = 'EXCLUDED' THEN '제외한 행입니다.' END)
-      WHERE import_job_id = ? AND classification NOT IN ('NEW','EXISTING_NEW_ENROLLMENT')`, j.id);
+      WHERE import_job_id = ? AND classification != 'NEW'`, j.id);
     await run(`UPDATE import_jobs SET state = 'COMMITTING', idempotency_key = COALESCE(?, idempotency_key) WHERE id = ?`, U.str(req.body.idempotency_key, 100), j.id);
     return get('SELECT * FROM import_jobs WHERE id = ?', j.id);
   });
@@ -590,7 +572,7 @@ async function processCommitChunk(req, job, started) {
   const source = job.source_type === 'API' ? 'API' : 'IMPORT';
   // 등록 메모는 관리자 전용 필드: 강사가 올린 명단의 메모 열은 저장하지 않는다
   const keepMemo = req.user.isAdmin;
-  const NAME_MSG = req.user.isAdmin ? '기존 수강생 정보와 이름이 다릅니다. 확인 후 등록해주세요.' : '같은 전화번호로 다른 이름의 수강생이 이미 있습니다.';
+  const NAME_MSG = '이 강의의 기존 수강생과 이름이 다릅니다. 확인 후 등록해주세요.';
   while (Date.now() - started < COMMIT_BUDGET_MS) {
     const rows = await all('SELECT * FROM import_rows WHERE import_job_id = ? AND result IS NULL ORDER BY row_number LIMIT 50', job.id);
     if (!rows.length) break;
@@ -604,23 +586,20 @@ async function processCommitChunk(req, job, started) {
         await tx(async () => {
           const row = await get('SELECT * FROM import_rows WHERE import_job_id = ? AND row_number = ? FOR UPDATE', job.id, row0.row_number);
           if (row.result) return null; // 다른 호출이 이미 처리
-          let s = await get('SELECT * FROM students WHERE normalized_phone = ? FOR UPDATE', row.normalized_phone);
+          let s = await get('SELECT * FROM students WHERE course_id = ? AND normalized_phone = ? FOR UPDATE', job.course_id, row.normalized_phone);
           let o;
           if (s && s.normalized_name !== row.normalized_name) o = { result: 'FAILED', msg: NAME_MSG };
           else if (s && s.status !== 'ACTIVE') o = { result: 'FAILED', msg: '비활성화된 수강생입니다. 관리자 검토가 필요합니다.' };
-          else {
-            let created = false;
-            if (!s) {
-              const h = hashes.get(row.normalized_phone) || await A.hashPassword(row.normalized_phone, 'STUDENT');
-              s = await createStudent(row.normalized_name, row.normalized_phone, h); created = true;
-              await A.audit(actorReq, { courseId: job.course_id, targetType: 'STUDENT', targetId: s.id, action: 'STUDENT_CREATED', changed: { code: s.code, import_job: job.id } });
-            }
+          else if (s) {
             const ex = await get('SELECT * FROM enrollments WHERE course_id = ? AND student_id = ?', job.course_id, s.id);
-            if (ex) o = { result: 'SKIPPED', msg: ex.status === 'ACTIVE' ? '이미 등록된 수강생입니다. 기존 기록을 유지합니다.' : '재활성화가 필요합니다.', sid: s.id, eid: ex.id };
-            else {
-              const eid = await createEnrollment(actorReq, job.course_id, s.id, keepMemo ? row.memo : null, source);
-              o = { result: created ? 'CREATED' : 'LINKED', msg: created ? '신규 학생 등록' : '기존 학생 연결', sid: s.id, eid };
-            }
+            o = ex ? { result: 'SKIPPED', msg: ex.status === 'ACTIVE' ? '이미 등록된 수강생입니다. 기존 기록을 유지합니다.' : '재활성화가 필요합니다.', sid: s.id, eid: ex.id }
+              : { result: 'FAILED', msg: '수강 등록이 없는 학생 정보가 남아 있습니다. 관리자에게 문의해주세요.' };
+          } else {
+            const h = hashes.get(row.normalized_phone) || await A.hashPassword(row.normalized_phone, 'STUDENT');
+            s = await createStudent(job.course_id, row.normalized_name, row.normalized_phone, h);
+            await A.audit(actorReq, { courseId: job.course_id, targetType: 'STUDENT', targetId: s.id, action: 'STUDENT_CREATED', changed: { code: s.code, import_job: job.id } });
+            const eid = await createEnrollment(actorReq, job.course_id, s.id, keepMemo ? row.memo : null, source);
+            o = { result: 'CREATED', msg: '신규 학생 등록', sid: s.id, eid };
           }
           await run(`UPDATE import_rows SET result = ?, result_message = ?, student_id_optional = COALESCE(?, student_id_optional), enrollment_id_optional = COALESCE(?, enrollment_id_optional)
             WHERE import_job_id = ? AND row_number = ?`, o.result, o.msg, o.sid, o.eid, job.id, row.row_number);
@@ -639,7 +618,7 @@ async function processCommitChunk(req, job, started) {
     const j = await get('SELECT * FROM import_jobs WHERE id = ? FOR UPDATE', job.id);
     if (j.state !== 'COMMITTING') return;
     if ((await get('SELECT COUNT(*) AS n FROM import_rows WHERE import_job_id = ? AND result IS NULL', job.id)).n > 0) return;
-    const counts = { created: 0, linked: 0, skipped: 0, failed: 0 };
+    const counts = { created: 0, skipped: 0, failed: 0 };
     for (const x of await all('SELECT result, COUNT(*) AS n FROM import_rows WHERE import_job_id = ? GROUP BY result', job.id)) counts[x.result.toLowerCase()] = x.n;
     await run(`UPDATE import_jobs SET state = 'COMMITTED', counts = ?, committed_at = ? WHERE id = ?`, JSON.stringify(counts), now(), job.id);
     await A.audit(actorReq, { courseId: job.course_id, targetType: 'IMPORT', targetId: job.id, action: 'ROSTER_IMPORTED', changed: { ...counts, source } });

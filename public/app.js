@@ -212,7 +212,7 @@ function renderTopbar() {
   } else {
     if (ME.isAdmin) nav += link('#/a/dashboard', '대시보드');
     nav += link('#/a/courses', ME.isAdmin ? '강의' : '내 강의', (x) => x.startsWith('#/a/courses') || x.startsWith('#/a/c/') || x.startsWith('#/a/as/') || x.startsWith('#/a/e/') || x.startsWith('#/a/import'));
-    if (ME.isAdmin) nav += link('#/a/staff', '강사 관리') + link('#/a/students', '전체 학생', (x) => x.startsWith('#/a/students') || x.startsWith('#/a/st/')) + link('#/a/sources', '외부 연동') + link('#/a/logs', '변경 이력');
+    if (ME.isAdmin) nav += link('#/a/staff', '강사 관리') + link('#/a/students', '전체 수강생', (x) => x.startsWith('#/a/students') || x.startsWith('#/a/st/')) + link('#/a/sources', '외부 연동') + link('#/a/logs', '변경 이력');
     nav += link('#/a/account', '내 계정');
   }
   tb.innerHTML = `<div class="inner">${brand}<nav>${nav}</nav>
@@ -270,15 +270,31 @@ route('/login', async () => {
     </form></div>
     <p class="center small mt"><a href="#/staff-login">강사·관리자 로그인</a></p></div>`;
   const f = $('#f');
+  const enter = async () => { await loadMe(); location.hash = '#/s'; };
   f.addEventListener('submit', async (e) => {
     e.preventDefault();
     const err = $('.form-error', f); err.style.display = 'none';
     const btn = $('button', f); btn.disabled = true;
+    const cred = { name: f.name.value, phone: f.phone.value };
     try {
-      await POST('/api/auth/student/login', { name: f.name.value, phone: f.phone.value });
-      await loadMe(); location.hash = '#/s';
+      const r = await POST('/api/auth/student/login', cred);
+      if (r.choose) chooseCourse(cred, r.choose); else await enter();
     } catch (ex) { err.textContent = errMsg(ex); err.style.display = 'block'; } finally { btn.disabled = false; }
   });
+  // 같은 이름·전화번호로 여러 강의에 등록된 경우: 강의를 골라 그 강의로만 입장한다
+  function chooseCourse(cred, list) {
+    $('.login-wrap .card').innerHTML = `<h1>강의 선택</h1><p class="muted small">${esc(cred.name)}님으로 등록된 강의가 ${list.length}개 있습니다. 입장할 강의를 선택해주세요.</p>
+      <ul class="list mt">${list.map((x) => `<li><button class="btn block" data-sid="${esc(x.student_id)}">${esc(x.title)} ${esc(x.cohort_label)}</button></li>`).join('')}</ul>
+      <p class="form-error notice danger" style="display:none"></p>
+      <p class="small muted mt">다른 강의로 바꾸려면 로그아웃한 뒤 다시 로그인해 선택하면 됩니다.</p>`;
+    $$('[data-sid]').forEach((b) => b.addEventListener('click', async () => {
+      $$('[data-sid]').forEach((x) => { x.disabled = true; });
+      try { await POST('/api/auth/student/login', { ...cred, student_id: b.dataset.sid }); await enter(); } catch (ex) {
+        const err = $('.login-wrap .form-error'); err.textContent = errMsg(ex); err.style.display = 'block';
+        $$('[data-sid]').forEach((x) => { x.disabled = false; });
+      }
+    }));
+  }
 });
 route('/staff-login', async () => {
   if (ME) return (location.hash = '#/');
@@ -341,7 +357,8 @@ route('/s', async () => {
         <div class="small muted">강사: ${c.instructors.map((i) => esc(i.name)).join(', ') || '-'}${c.state === 'ENDED' || c.state === 'ARCHIVED' ? ' · 종료된 강의' : ''}</div>
         <div class="row mt"><div class="grow">${progressBar(c.rate)}</div><span class="small">${c.total ? `완료 ${c.completed}/${c.total} (${pctText(c.rate)})` : '공개된 과제가 없습니다'}</span></div>
         ${c.running_challenges.length ? `<div class="small mt">진행 중 챌린지: ${c.running_challenges.map((x) => `${esc(x.title)} (~${esc(x.end_date)})`).join(', ')}</div>` : ''}
-      </a>`).join('') : '<div class="card center pad">현재 이용 가능한 강의가 없습니다. 운영자에게 문의해주세요.</div>'}`;
+      </a>`).join('') : '<div class="card center pad">현재 이용 가능한 강의가 없습니다. 운영자에게 문의해주세요.</div>'}
+    <p class="small muted mt">다른 강의도 수강 중이라면 로그아웃한 뒤 다시 로그인해 강의를 선택해주세요.</p>`;
 }, { auth: 'STUDENT', narrow: true });
 
 route('/s/c/:id', async ({ id }) => {
