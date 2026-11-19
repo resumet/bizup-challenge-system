@@ -409,6 +409,8 @@ async function courseChallenges(el, c) {
         <div class="small muted">${esc(ch.start_date)} ~ ${esc(ch.end_date)} · 종료 후 ${ch.allow_after_deadline ? '<strong>수정 허용</strong>' : '마감'} · 공개 과제 ${ch.stats.published_assignments}개 · 완료 ${ch.stats.completed}/${ch.stats.target} (${pctText(ch.stats.rate)}) · 완주 ${ch.stats.finishers}명</div></div>
         <div class="row"><button class="btn sm" data-edit-ch="${ch.id}">수정</button><button class="btn sm" data-new-as="${ch.id}">+ 과제</button><button class="btn sm" data-lib="${ch.id}">기존 과제 복사</button><button class="btn sm danger" data-del-ch="${ch.id}">삭제</button></div></div>
       ${ch.description ? `<p class="small pre">${esc(ch.description)}</p>` : ''}
+      ${ch.visibility === 'DRAFT' && ch.assignments.some((a) => a.visibility === 'PUBLISHED') ? `<div class="notice warn mt row between"><span>이 챌린지가 <strong>초안</strong>이라 공개한 과제도 수강생에게 보이지 않습니다.</span>
+        <button class="btn sm primary" data-pub-ch="${ch.id}">챌린지 공개</button></div>` : ''}
       <div class="table-wrap mt"><table><thead><tr><th>과제</th><th>상태</th><th class="num">할 일</th><th>제출</th><th class="num">완료</th></tr></thead><tbody>
       ${ch.assignments.map((a) => `<tr class="click" data-href="#/a/as/${a.id}"><td>${esc(a.title)}${a.copied_from_id ? ' <span class="small muted">(복사본)</span>' : ''}</td>
         <td>${a.visibility === 'DRAFT' ? '<span class="badge warn">초안</span>' : '<span class="badge ok">공개</span>'} ${a.locked_at ? '<span class="badge" title="완료 조건 동결">🔒 동결</span>' : ''}</td>
@@ -416,6 +418,11 @@ async function courseChallenges(el, c) {
       </tbody></table></div></div>`).join('') || '<div class="card center muted">챌린지가 없습니다.</div>'}`;
   $$('tr[data-href]', el).forEach((tr) => tr.addEventListener('click', () => { location.hash = tr.dataset.href; }));
   $('#new-ch').addEventListener('click', () => challengeModal(c));
+  $$('[data-pub-ch]').forEach((b) => b.addEventListener('click', async () => {
+    const ch = items.find((x) => x.id === b.dataset.pubCh);
+    if (!(await confirmModal(`'${ch.title}' 챌린지를 공개합니다.\n이 챌린지의 공개 과제가 모든 수강생에게 보이고 진행률에 반영됩니다.`, { okText: '챌린지 공개' }))) return;
+    try { await PATCH('/api/challenges/' + ch.id, { visibility: 'PUBLISHED', version: ch.version }); toast('챌린지를 공개했습니다.'); rerender(); } catch (e) { toast(errMsg(e), true); }
+  }));
   $$('[data-edit-ch]').forEach((b) => b.addEventListener('click', () => challengeModal(c, items.find((x) => x.id === b.dataset.editCh))));
   $$('[data-del-ch]').forEach((b) => b.addEventListener('click', async () => {
     if (!(await confirmModal('챌린지와 소속 과제(초안 포함)를 삭제합니다. 학생 수행·피드백 이력이 있으면 삭제할 수 없습니다.', { okText: '삭제', danger: true }))) return;
@@ -486,6 +493,8 @@ function renderAssignmentEditor(a) {
       ${a.visibility === 'DRAFT' ? '<button class="btn primary" id="publish">공개</button>' : (a.has_history ? '' : '<button class="btn" id="unpublish">공개 취소</button>')}
       ${a.has_history ? '' : '<button class="btn danger" id="delete">삭제</button>'}</div></div>
     <p class="small muted">작성 ${esc(a.created_by_name || '-')} · 최종 수정 ${esc(a.updated_by_name || '-')} ${fmtDT(a.updated_at)}${a.copied_from ? ` · 원본: ${esc(a.copied_from.course_code)} ${esc(a.copied_from.title)}` : ''}</p>
+    ${a.visibility === 'PUBLISHED' && a.challenge.visibility === 'DRAFT' ? `<div class="notice danger row between"><span>공개한 과제지만 <strong>소속 챌린지 '${esc(a.challenge.title)}'가 초안</strong>이라 수강생에게 보이지 않습니다.</span>
+      <button class="btn sm primary" id="pub-ch">챌린지도 공개</button></div>` : ''}
     ${L ? `<p class="notice warn">수강생이 시작한 과제입니다(${fmtDT(a.locked_at)}). 해야 할 일과 제출 필수·선택 설정은 변경할 수 없습니다. 수행 조건을 바꾸려면 복사하여 새 과제로 만들어주세요. 제목·설명 오탈자 정정과 자료 추가는 가능하며 이력이 남습니다.</p>` : ''}
     <form id="af" class="card mt">
       <div class="field"><label>과제 제목 *</label><input type="text" name="title" value="${esc(a.title)}" required maxlength="200"></div>
@@ -549,9 +558,28 @@ function renderAssignmentEditor(a) {
     $('#rstate').textContent = ''; e.target.value = '';
   });
   const pub = $('#publish');
+  const NOTE = '공개하면 이 강의의 모든 수강생에게 공통 과제로 적용됩니다.\n전체 수강생의 과제 수에 추가되어 진행률이 달라질 수 있습니다.';
   if (pub) pub.addEventListener('click', async () => {
-    if (!(await confirmModal('공개하면 이 강의의 모든 수강생에게 공통 과제로 적용됩니다.\n전체 수강생의 과제 수에 추가되어 진행률이 달라질 수 있습니다.' + (a.challenge.visibility === 'DRAFT' ? '\n(소속 챌린지가 초안이므로 챌린지를 공개해야 학생에게 보입니다.)' : ''), { okText: '공개' }))) return;
+    // 학생에게는 챌린지와 과제가 모두 공개여야 보인다. 챌린지가 초안이면 함께 공개할지 묻는다.
+    if (a.challenge.visibility === 'DRAFT') {
+      const m = modal(`<h2>과제 공개</h2><p class="pre">${esc(NOTE)}</p>
+        <p class="notice warn small">소속 챌린지 '${esc(a.challenge.title)}'가 <strong>초안</strong>입니다. 챌린지도 공개해야 수강생에게 보입니다.</p>
+        <div class="actions"><button class="btn" data-close>취소</button><button class="btn" id="only">과제만 공개 (나중에 챌린지 공개)</button><button class="btn primary" id="both">챌린지와 함께 공개</button></div>`);
+      const go = async (withChallenge) => {
+        m.close();
+        try { renderAssignmentEditor(await POST(`/api/assignments/${a.id}/publish`, { publish_challenge: withChallenge })); toast(withChallenge ? '챌린지와 과제를 공개했습니다.' : '과제를 공개했습니다. 챌린지를 공개하면 수강생에게 보입니다.'); } catch (e) { toast(errMsg(e), true); }
+      };
+      $('#only', m.el).addEventListener('click', () => go(false));
+      $('#both', m.el).addEventListener('click', () => go(true));
+      return;
+    }
+    if (!(await confirmModal(NOTE, { okText: '공개' }))) return;
     try { renderAssignmentEditor(await POST(`/api/assignments/${a.id}/publish`)); toast('공개했습니다.'); } catch (e) { toast(errMsg(e), true); }
+  });
+  const pubCh = $('#pub-ch');
+  if (pubCh) pubCh.addEventListener('click', async () => {
+    if (!(await confirmModal(`'${a.challenge.title}' 챌린지를 공개합니다.\n이 챌린지의 공개 과제가 모든 수강생에게 보이고 진행률에 반영됩니다.`, { okText: '챌린지 공개' }))) return;
+    try { renderAssignmentEditor(await POST(`/api/assignments/${a.id}/publish`, { publish_challenge: true })); toast('챌린지를 공개했습니다.'); } catch (e) { toast(errMsg(e), true); }
   });
   const unp = $('#unpublish');
   if (unp) unp.addEventListener('click', async () => { try { renderAssignmentEditor(await POST(`/api/assignments/${a.id}/unpublish`)); toast('초안으로 전환했습니다.'); } catch (e) { toast(errMsg(e), true); } });

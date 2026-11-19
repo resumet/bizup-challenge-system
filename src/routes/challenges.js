@@ -225,6 +225,14 @@ r.post('/assignments/:id/publish', A.requireStaff, async (req, res) => {
     const a = await AC.loadAssignmentForStaff(req.user, req.params.id, true);
     if (!a.title.trim()) throw E.invalid('과제 제목을 입력해주세요.');
     if (!(await itemsOf(a.id)).length) throw E.invalid('해야 할 일을 1개 이상 추가해주세요.');
+    // 학생에게는 챌린지와 과제가 모두 공개여야 보인다. 요청하면 초안 챌린지도 함께 공개한다.
+    if (req.body && req.body.publish_challenge) {
+      const ch = await get('SELECT * FROM challenges WHERE id = ? FOR UPDATE', a.challenge_id);
+      if (ch.visibility === 'DRAFT') {
+        await run(`UPDATE challenges SET visibility = 'PUBLISHED', version = version + 1, updated_by = ?, updated_at = ? WHERE id = ?`, req.user.id, now(), ch.id);
+        await A.audit(req, { courseId: ch.course_id, targetType: 'CHALLENGE', targetId: ch.id, action: 'CHALLENGE_UPDATED', changed: { visibility: ['DRAFT', 'PUBLISHED'] } });
+      }
+    }
     if (a.visibility === 'PUBLISHED') return assignmentView(a);
     await run(`UPDATE assignments SET visibility = 'PUBLISHED', published_at = ?, version = version + 1, updated_by = ?, updated_at = ? WHERE id = ?`, now(), req.user.id, now(), a.id);
     await A.audit(req, { courseId: a.course_id, targetType: 'ASSIGNMENT', targetId: a.id, action: 'ASSIGNMENT_PUBLISHED' });

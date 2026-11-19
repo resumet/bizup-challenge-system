@@ -569,3 +569,24 @@ test('외부 API 명단 가져오기 (관리자 전용): 연동 소스·연결 �
     for (const ip of ['8.8.8.8', '2606:4700::1111']) assert.ok(!isBlockedAddress(ip), ip);
   } finally { api.close(); }
 });
+
+test('공개 과제 노출: 등록 순서와 무관, 초안 챌린지 안의 과제는 숨김, 챌린지 함께 공개', async () => {
+  const c = await mkCourse('노출', '1기');
+  // 챌린지(초안)와 과제를 먼저 만들고 과제만 공개한 뒤, 수강생을 나중에 등록 (실제 운영 상황 재현)
+  const ch = await mkChallenge(c.id, { visibility: 'DRAFT' });
+  const a = await mkAssignment(ch.id);
+  await enroll(c.id, '나중등록', '01053000001');
+  const s = await student('나중등록', '01053000001');
+  const titles = async () => (ok(await s.get(`/api/me/courses/${c.id}`)).challenges || []).flatMap((x) => (x.assignments || []).map((y) => y.id));
+  assert.deepEqual(await titles(), []);
+  assert.equal((await s.get(`/api/me/assignments/${a.id}`)).status, 404);
+  // 과제 공개 시 챌린지도 함께 공개 → 나중에 등록한 학생에게도 바로 보임
+  ok(await admin.post(`/api/assignments/${a.id}/publish`, { publish_challenge: true }));
+  assert.equal((await get('SELECT visibility FROM challenges WHERE id = ?', ch.id)).visibility, 'PUBLISHED');
+  assert.deepEqual(await titles(), [a.id]);
+  ok(await s.get(`/api/me/assignments/${a.id}`));
+  // 공개 이후에 등록한 학생도 동일하게 보임
+  await enroll(c.id, '더나중', '01053000002');
+  const s2 = await student('더나중', '01053000002');
+  ok(await s2.get(`/api/me/assignments/${a.id}`));
+});
