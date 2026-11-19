@@ -89,10 +89,11 @@ r.get('/enrollments/:id/detail', A.requireStaff, async (req, res) => {
   const e = await AC.loadEnrollmentForStaff(req.user, req.params.id);
   const s = await get('SELECT * FROM students WHERE id = ?', e.student_id);
   const c = await get('SELECT id, code, title, cohort_label, state FROM courses WHERE id = ?', e.course_id);
-  // 다른 수강 이력: 관리자는 전체, 강사는 자신이 배정된 강의만
-  const others = await all(`SELECT e2.id, e2.status, c2.id AS course_id, c2.code, c2.title, c2.cohort_label FROM enrollments e2 JOIN courses c2 ON c2.id = e2.course_id
-    WHERE e2.student_id = ? AND e2.id != ? ${req.user.isAdmin ? '' : `AND EXISTS (SELECT 1 FROM course_instructors ci WHERE ci.course_id = c2.id AND ci.instructor_id = ? AND ci.status = 'ACTIVE')`}`,
-  s.id, e.id, ...(req.user.isAdmin ? [] : [req.user.instructorId]));
+  // 학생은 강의마다 별개라 다른 강의 수강 이력은 저장하지 않는다.
+  // 관리자만 같은 전화번호를 가진 다른 강의의 수강생을 조회할 수 있다(강사에게는 내려주지 않음).
+  const samePhone = req.user.isAdmin ? await all(`SELECT e2.id, e2.status, s2.code AS student_code, s2.name, c2.id AS course_id, c2.code, c2.title, c2.cohort_label
+      FROM students s2 JOIN enrollments e2 ON e2.student_id = s2.id JOIN courses c2 ON c2.id = e2.course_id
+      WHERE s2.normalized_phone = ? AND s2.id != ? ORDER BY e2.enrolled_at DESC`, s.normalized_phone, s.id) : undefined;
   const assignments = await P.publishedAssignments(c.id);
   const cells = await P.cellMatrix(c.id, [e.id], assignments);
   const tasks = await Promise.all(assignments.map(async (a) => {
@@ -113,7 +114,7 @@ r.get('/enrollments/:id/detail', A.requireStaff, async (req, res) => {
     enrollment: { id: e.id, status: e.status, enrolled_at: e.enrolled_at, deactivated_at: e.deactivated_at, reason: e.reason, admin_memo: req.user.isAdmin ? e.admin_memo : undefined },
     student: { id: s.id, code: s.code, name: s.name, status: s.status, phone: req.user.isAdmin ? U.formatPhone(s.normalized_phone) : U.maskPhone(s.normalized_phone) },
     can_reveal_login: req.user.isAdmin || (e.status === 'ACTIVE' && s.status === 'ACTIVE'),
-    course: c, other_enrollments: others, tasks,
+    course: c, same_phone_enrollments: samePhone, tasks,
   });
 });
 

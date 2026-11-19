@@ -16,7 +16,7 @@ process.env.STUDENT_SCRYPT_N = '1024';
 process.env.LOGIN_MAX_FAILURES = '1000';
 process.env.ROSTER_API_ALLOW_PRIVATE = '1'; // 로컬 모의 API 서버 사용
 
-const { get, run, uuid, now, close, migrate } = require('../src/db');
+const { get, all, run, uuid, now, close, migrate, driver } = require('../src/db');
 const { hashPassword } = require('../src/auth');
 const { setClockOffset } = require('../src/util');
 const { createApp } = require('../src/server');
@@ -46,7 +46,18 @@ async function mkAssignment(chId, { items = ['할 일 1', '할 일 2'], required
   if (publish) ok(await admin.post(`/api/assignments/${a.id}/publish`));
   return a;
 }
-async function student(name, phone) { const c = C(); ok(await c.studentLogin(name, phone), 'student login'); return c; }
+// 학생 로그인. 같은 이름·번호가 여러 강의에 있으면 pick(강의명)으로 고른다.
+async function student(name, phone, pick) {
+  const c = C(); const r = ok(await c.studentLogin(name, phone), 'student login');
+  if (r.choose) {
+    assert.ok(pick, '강의 선택이 필요한 로그인: ' + JSON.stringify(r.choose));
+    const x = r.choose.find((o) => o.title === pick);
+    assert.ok(x, 'no course ' + pick);
+    ok(await c.post('/api/auth/student/login', { name, phone, student_id: x.student_id }), 'choose');
+    await c.refreshCsrf();
+  }
+  return c;
+}
 async function preview(client, courseId, name, buf) {
   const f = await client.uploadFile(name, buf, 'roster');
   if (f.status !== 200) return f;
@@ -76,17 +87,44 @@ test('AT-01/02 기수별 별도 강의, 공동 강사 권한 범위', async () =
   assert.equal(dup.status, 409); assert.equal(dup.data.error.reason, 'POSSIBLE_DUPLICATE');
 });
 
-test('AT-03/04/05/06 전화번호 기준 학생 단일화·정규화·동명이인·충돌', async () => {
-  const c1 = await mkCourse('A', '1기'); const c2 = await mkCourse('B', '1기');
+test('AT-03/04/05/06 강의별 학생 분리·정규화·동명이인·강의 안 충돌·강의 선택 로그인', async () => {
+  const i = await mkInstructor('sep-i@t.com', '분리강사');
+  const c1 = await mkCourse('A', '1기', [i.id]); const c2 = await mkCourse('B', '1기'); const c3 = await mkCourse('C', '1기');
   const r1 = await enroll(c1.id, '홍길동', '010-2000-0001');
   const r2 = await enroll(c2.id, '홍길동', '+82 10 2000 0001');
-  assert.equal(r1.student.id, r2.student.id);
-  assert.equal((await get('SELECT COUNT(*) AS n FROM enrollments WHERE student_id = ?', r1.student.id)).n, 2);
-  await enroll(c1.id, '홍길동', '01020000002');
-  await student('홍길동', '010 2000 0001'); await student('홍길동', '01020000002');
+  // 같은 번호라도 강의마다 별개 학생 (번호·이름 공유 없음)
+  assert.notEqual(r1.student.id, r2.student.id); assert.notEqual(r1.student.code, r2.student.code);
+  assert.equal((await get('SELECT COUNT(*) AS n FROM enrollments WHERE student_id = ?', r1.student.id)).n, 1);
+  // 같은 강의 안에서는 정규화한 번호로 중복을 막는다
+  const again = await admin.post(`/api/courses/${c1.id}/enrollments`, { name: '홍길동', phone: '+82-10-2000-0001' });
+  assert.equal(again.status, 409); assert.equal(again.data.error.reason, 'ALREADY_ENROLLED');
+  await enroll(c1.id, '홍길동', '01020000002'); // 동명이인
+  // 같은 강의 안에서 같은 번호·다른 이름은 충돌, 다른 강의에서는 별개로 등록
   const conflict = await admin.post(`/api/courses/${c2.id}/enrollments`, { name: '김철수', phone: '01020000001' });
   assert.equal(conflict.status, 409); assert.equal(conflict.data.error.reason, 'NAME_CONFLICT');
+  const r3 = await enroll(c3.id, '김철수', '01020000001');
   assert.equal((await get('SELECT name FROM students WHERE id = ?', r1.student.id)).name, '홍길동');
+  // 로그인: 같은 이름·번호가 두 강의에 있으면 강의를 고르고, 그 강의만 보인다
+  const pre = ok(await C().studentLogin('홍길동', '010 2000 0001'));
+  assert.deepEqual(pre.choose.map((x) => x.title).sort(), ['A', 'B']);
+  const sB = await student('홍길동', '010 2000 0001', 'B');
+  assert.equal(ok(await sB.get('/api/me/profile')).code, r2.student.code);
+  assert.deepEqual(ok(await sB.get('/api/me/courses')).items.map((x) => x.id), [c2.id]);
+  assert.equal((await sB.get(`/api/me/courses/${c1.id}`)).status, 404);
+  const wrongPick = await C().post('/api/auth/student/login', { name: '홍길동', phone: '01020000001', student_id: r3.student.id });
+  assert.equal(wrongPick.status, 400); // 이름이 다른 강의 계정은 고를 수 없음
+  await student('홍길동', '01020000002'); await student('김철수', '01020000001');
+  // 관리자만 같은 전화번호의 다른 강의 수강 이력을 볼 수 있다
+  const st = ok(await admin.get(`/api/students/${r1.student.id}`));
+  assert.deepEqual(st.same_phone.map((x) => x.course_id).sort(), [c2.id, c3.id].sort());
+  const adminDetail = ok(await admin.get(`/api/enrollments/${r1.enrollment_id}/detail`));
+  assert.equal(adminDetail.same_phone_enrollments.length, 2);
+  const insDetail = ok(await i.client.get(`/api/enrollments/${r1.enrollment_id}/detail`));
+  assert.equal(insDetail.same_phone_enrollments, undefined);
+  assert.doesNotMatch(JSON.stringify(insDetail), new RegExp(c2.id));
+  assert.equal((await i.client.get(`/api/students/${r1.student.id}`)).status, 403);
+  const list = ok(await admin.get('/api/students?q=01020000001'));
+  assert.equal(list.items.length, 3); assert.ok(list.items.every((x) => x.same_phone_count === 2));
   const bad = await C().studentLogin('홍길동', '01099999999');
   assert.equal(bad.status, 401);
   const bad2 = await C().studentLogin('없는사람', '01020000001');
@@ -300,7 +338,7 @@ test('AT-42~48 등록 비활성화 범위, 권한 우회 차단, 빈 집계, 진
   const e1 = await enroll(c1.id, '권한생', '01022220001'); await enroll(c2.id, '권한생', '01022220001');
   await enroll(c1.id, '타인', '01022220002');
   const ch = await mkChallenge(c1.id); const a = await mkAssignment(ch.id);
-  const me = await student('권한생', '01022220001'); const other = await student('타인', '01022220002');
+  const me = await student('권한생', '01022220001', '권한1'); const other = await student('타인', '01022220002');
   const f = ok(await me.uploadFile('note.txt', Buffer.from('hello')));
   ok(await me.post(`/api/me/assignments/${a.id}/submissions`, { type: 'FILE', file_id: f.id }));
   assert.equal((await other.get(`/api/files/${f.id}/download`)).status, 404);
@@ -311,7 +349,10 @@ test('AT-42~48 등록 비활성화 범위, 권한 우회 차단, 빈 집계, 진
   ok(await admin.patch(`/api/enrollments/${e1.enrollment_id}/status`, { status: 'INACTIVE', reason: '환불' }));
   assert.equal((await me.get(`/api/me/courses/${c1.id}`)).status, 404);
   assert.equal((await me.get(`/api/files/${f.id}/download`)).status, 404);
-  ok(await me.get(`/api/me/courses/${c2.id}`));
+  // 다른 강의(권한2)는 별개 계정: 권한1 세션으로는 볼 수 없고, 권한1 비활성 중에는 로그인하면 바로 권한2로 들어간다
+  assert.equal((await me.get(`/api/me/courses/${c2.id}`)).status, 404);
+  const me2 = await student('권한생', '01022220001');
+  ok(await me2.get(`/api/me/courses/${c2.id}`));
   ok(await admin.patch(`/api/enrollments/${e1.enrollment_id}/status`, { status: 'ACTIVE', reason: '복원' }));
   const back = ok(await me.get(`/api/me/assignments/${a.id}`));
   assert.equal(back.submissions.length, 1);
@@ -469,11 +510,11 @@ test('강사 명단 관리: 담당 강의 개별 등록·엑셀 업로드·수�
   const e1 = ok(await i.client.post(`/api/courses/${mine.id}/enrollments`, { name: '강사등록', phone: '010-5100-0001', memo: '강사메모' }), 'manual');
   assert.equal((await get('SELECT admin_memo FROM enrollments WHERE id = ?', e1.enrollment_id)).admin_memo, null);
   assert.equal((await i.client.post(`/api/courses/${theirs.id}/enrollments`, { name: '남의강의', phone: '01051000002' })).status, 404);
-  assert.equal((await i.client.post(`/api/courses/${mine.id}/enrollments`, { student_id: e1.student.id })).status, 403);
-  // 다른 강의 학생과 이름 충돌 시 기존 정보는 노출하지 않음
-  await enroll(theirs.id, '비밀이름', '01051000009');
-  const conflict = await i.client.post(`/api/courses/${mine.id}/enrollments`, { name: '다른이름', phone: '01051000009' });
-  assert.equal(conflict.status, 409); assert.equal(conflict.data.error.existing, undefined); assert.doesNotMatch(conflict.data.error.message, /비밀이름/);
+  assert.equal((await i.client.post(`/api/courses/${mine.id}/enrollments`, { student_id: e1.student.id })).status, 400); // 기존 학생 연결 없음
+  // 다른 강의에 같은 번호가 있어도 이 강의에는 별개 수강생으로 등록되고, 다른 강의 정보는 노출하지 않음
+  const theirsSt = await enroll(theirs.id, '비밀이름', '01051000009');
+  const sep = ok(await i.client.post(`/api/courses/${mine.id}/enrollments`, { name: '다른이름', phone: '01051000009' }));
+  assert.notEqual(sep.student.id, theirsSt.student.id); assert.doesNotMatch(JSON.stringify(sep), /비밀이름/);
   // 엑셀(CSV) 업로드 → 미리보기 → 확정
   const job = ok(await preview(i.client, mine.id, 'roster.csv', Buffer.from('이름,전화번호,메모\n업로드1,010-5100-0011,x\n비밀아님,01051000009,\n')), 'preview');
   assert.equal(job.committable, 1);
@@ -489,17 +530,19 @@ test('강사 명단 관리: 담당 강의 개별 등록·엑셀 업로드·수�
   assert.equal((await i.client.patch(`/api/enrollments/${e1.enrollment_id}/student`, { phone: '01051000003' })).status, 400);
   ok(await i.client.patch(`/api/enrollments/${e1.enrollment_id}/student`, { name: '강사수정', phone: '01051000003', reason: '오타' }), 'edit');
   await student('강사수정', '01051000003'); // 바뀐 번호로 로그인 가능
-  // 다른 강사의 강의에도 등록된 학생은 수정 불가
-  await enroll(theirs.id, '강사수정', '01051000003');
-  assert.equal((await i.client.patch(`/api/enrollments/${e1.enrollment_id}/student`, { name: '또수정', reason: 'x' })).status, 403);
+  // 다른 강의에 같은 번호가 있어도 강사는 자기 강의 학생을 수정할 수 있고, 다른 강의 학생은 바뀌지 않음
+  const twin = await enroll(theirs.id, '강사수정', '01051000003');
+  ok(await i.client.patch(`/api/enrollments/${e1.enrollment_id}/student`, { name: '또수정', reason: 'x' }));
+  assert.equal((await get('SELECT name FROM students WHERE id = ?', twin.student.id)).name, '강사수정');
   // 삭제: 기록이 없으면 삭제 (다른 등록이 없는 학생은 함께 삭제)
   const e2 = ok(await i.client.post(`/api/courses/${mine.id}/enrollments`, { name: '삭제대상', phone: '01051000004' }));
   const del = ok(await i.client.del(`/api/enrollments/${e2.enrollment_id}`));
   assert.equal(del.student_deleted, true);
   assert.equal(await get('SELECT id FROM students WHERE id = ?', e2.student.id), undefined);
-  // 다른 강의에도 등록된 학생은 이 강의 등록만 삭제
+  // 학생은 강의마다 별개이므로 삭제하면 이 강의 학생만 지워지고 다른 강의의 같은 번호 학생은 남는다
   const del1 = ok(await i.client.del(`/api/enrollments/${e1.enrollment_id}`));
-  assert.equal(del1.student_deleted, false);
+  assert.equal(del1.student_deleted, true);
+  assert.ok(await get('SELECT id FROM students WHERE id = ?', twin.student.id));
   // 수행 기록이 있으면 삭제 대신 비활성화
   const ch = await mkChallenge(mine.id); const a = await mkAssignment(ch.id);
   const e3 = ok(await i.client.post(`/api/courses/${mine.id}/enrollments`, { name: '수행함', phone: '01051000005' }));
@@ -589,4 +632,31 @@ test('공개 과제 노출: 등록 순서와 무관, 초안 챌린지 안의 과
   await enroll(c.id, '더나중', '01053000002');
   const s2 = await student('더나중', '01053000002');
   ok(await s2.get(`/api/me/assignments/${a.id}`));
+});
+
+test('마이그레이션: 여러 강의에 공유된 기존 학생을 강의별 학생으로 분리 (재실행 안전)', async () => {
+  const c1 = await mkCourse('이관', '1기'); const c2 = await mkCourse('이관', '2기');
+  const r1 = await enroll(c1.id, '이관생', '01077770001');
+  const ch = await mkChallenge(c2.id); await mkAssignment(ch.id);
+  // 이전 정책 데이터 재현: 같은 학생이 두 강의에 등록 (분리 제약을 잠시 해제)
+  await run('DROP INDEX ux_enr_one_per_student'); await run('DROP INDEX ux_students_course_phone');
+  const e2 = uuid();
+  await run(`INSERT INTO enrollments(id, course_id, student_id, status, enrolled_at) VALUES(?,?,?,'ACTIVE',?)`, e2, c2.id, r1.student.id, now());
+  await run('UPDATE students SET course_id = NULL WHERE id = ?', r1.student.id);
+  const sql = fs.readFileSync(path.join(__dirname, '..', 'supabase', 'migrations', '20261120000000_per_course_students.sql'), 'utf8');
+  const d = await driver();
+  await d.exec(sql); await d.exec(sql); // 두 번 실행해도 결과 동일
+  const rows = await all(`SELECT e.id, e.course_id, s.id AS sid, s.code, s.course_id AS s_course, c.password_hash FROM enrollments e
+    JOIN students s ON s.id = e.student_id JOIN student_credentials c ON c.student_id = s.id WHERE e.id IN (?, ?) ORDER BY e.enrolled_at`, r1.enrollment_id, e2);
+  assert.equal(rows.length, 2);
+  assert.equal(rows[0].sid, r1.student.id); assert.notEqual(rows[1].sid, r1.student.id);
+  assert.equal(rows[0].s_course, c1.id); assert.equal(rows[1].s_course, c2.id);
+  assert.notEqual(rows[0].code, rows[1].code);
+  // 분리 후 로그인: 강의를 골라 들어간다
+  const pre = ok(await C().studentLogin('이관생', '01077770001'));
+  assert.equal(pre.choose.length, 2);
+  const s2 = await student('이관생', '01077770001', '이관');
+  assert.equal(ok(await s2.get('/api/me/courses')).items.length, 1);
+  // 제약이 다시 걸려 있다
+  await assert.rejects(run(`INSERT INTO enrollments(id, course_id, student_id, status, enrolled_at) VALUES(?,?,?,'ACTIVE',?)`, uuid(), c1.id, rows[1].sid, now()));
 });
